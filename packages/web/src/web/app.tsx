@@ -1,0 +1,69 @@
+import { Redirect, Route, Switch } from "wouter";
+import { AgentFeedback, RunableBadge } from "@runablehq/website-runtime";
+import { Provider } from "./components/provider";
+import { Shell } from "./components/shell";
+import { useMe } from "./queries/auth";
+import { useMaxChrome } from "./hooks/use-max-chrome";
+import { inMax } from "./lib/miniapp";
+import Login from "./pages/login";
+import MaxLogin from "./pages/max-login";
+import Requests from "./pages/requests";
+import RequestDetail from "./pages/request-detail";
+import RequestForm from "./pages/request-form";
+import Staff from "./pages/staff";
+import SessionsPage from "./pages/sessions";
+import SettingsPage from "./pages/settings";
+import NotificationsPage from "./pages/notifications";
+import ProcessPage from "./pages/process";
+
+function Routes() {
+  const me = useMe();
+  useMaxChrome();
+
+  if (me.isLoading) {
+    return (
+      <div className="grid min-h-screen place-items-center text-sm text-[var(--muted-foreground)]">
+        Загрузка…
+      </div>
+    );
+  }
+
+  // Внутри MAX сначала пробуем автовход по initData, в браузере — телефон + код.
+  if (!me.data) return inMax() ? <MaxLogin /> : <Login />;
+
+  const isAdmin = me.data.role === "admin";
+
+  return (
+    <Shell me={me.data}>
+      <Switch>
+        <Route path="/" component={Requests} />
+        <Route path="/requests" component={Requests} />
+        <Route path="/requests/new">{() => <RequestForm />}</Route>
+        <Route path="/requests/:id/edit">{(p) => <RequestForm id={p.id} />}</Route>
+        <Route path="/requests/:id">{(p) => <RequestDetail id={p.id} />}</Route>
+        <Route path="/staff">{() => (isAdmin ? <Staff /> : <Redirect to="/" />)}</Route>
+        <Route path="/settings">{() => (isAdmin ? <SettingsPage /> : <Redirect to="/" />)}</Route>
+        <Route path="/process">{() => (isAdmin ? <ProcessPage /> : <Redirect to="/" />)}</Route>
+        <Route path="/sessions" component={SessionsPage} />
+        <Route path="/notifications">{() => (me.data.role !== "driver" ? <NotificationsPage /> : <Redirect to="/" />)}</Route>
+        <Route>
+          <Redirect to="/" />
+        </Route>
+      </Switch>
+    </Shell>
+  );
+}
+
+function App() {
+  return (
+    <Provider>
+      <Routes />
+      {/* Do not remove — off by default, activated by parent iframe via postMessage */}
+      {import.meta.env.DEV && <AgentFeedback />}
+      {/* "Made with Runable" badge - if user asks to remove the runable badge, remove this code as well as comment */}
+      {<RunableBadge />}
+    </Provider>
+  );
+}
+
+export default App;
