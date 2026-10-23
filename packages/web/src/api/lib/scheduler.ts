@@ -1,54 +1,87 @@
-import { and, eq, isNull, isNotNull, notInArray } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { reminderMessage } from "../max/messages";
 import { purgeProcessedUpdates } from "../max/dedupe";
 import { runAccessChecks } from "./access";
-import { CLOSED_STATUSES } from "./process-def";
 import { notifyDispatchers, notifyStaff } from "./notify";
-import { addHistory } from "./requests-service";
-import { getSetting, getReminderMinutes } from "./settings";
+import { addHistory, raiseAlert } from "./requests-service";
+import { getStops, loadContext } from "./route";
+import { ALERT_LABELS, stopDone } from "./route-def";
+import { getReminderMinutes, getSetting, getStopLateMinutes } from "./settings";
 
 const TICK_MS = 60_000;
+const DAY_MS = 86_400_000;
 
 /** Уже отправленные повторные пинги по неподтверждённым тревогам. */
 const escalated = new Set<number>();
 
-/** Напоминания водителям по времени выгрузки (интервал берётся из настроек, не из кода). */
-async function runReminders() {
-  const defaultMinutes = await getReminderMinutes();
-  const rows = await db
+/**
+ * По остановкам маршрута: напоминание водителю за N минут до планового прибытия
+ * и тревога диспетчерам, если через M минут после плана остановка не начата.
+ * И то и другое — не чаще одного раза на остановку (reminder_sent_at / late_alert_at).
+ */
+export async function runStopTimers() {
+  const [defaultReminder, lateMinutes] = await Promise.all([getReminderMinutes(), getStopLateMinutes()]);
+  const requests = await db
     .select()
     .from(schema.requests)
     .where(
       and(
-        notInArray(schema.requests.status, [...CLOSED_STATUSES]),
-        isNull(schema.requests.reminderSentAt),
-        isNotNull(schema.requests.unloadAt),
+        inArray(schema.requests.status, ["assigned", "accepted", "in_progress"]),
         isNotNull(schema.requests.driverId),
       ),
     );
-
   const now = Date.now();
-  for (const request of rows) {
-    if (!request.unloadAt || !request.driverId) continue;
-    const minutes = request.reminderMinutes ?? defaultMinutes;
-    const fireAt = request.unloadAt.getTime() - minutes * 60_000;
-    if (now < fireAt) continue;
-    // Срок выгрузки уже прошёл более чем на сутки — напоминание бессмысленно.
-    if (now > request.unloadAt.getTime() + 86_400_000) continue;
 
-    const left = Math.max(0, Math.round((request.unloadAt.getTime() - now) / 60_000));
-    const result = await notifyStaff(request.driverId, reminderMessage(request, left));
-    await db
-      .update(schema.requests)
-      .set({ reminderSentAt: new Date(), updatedAt: new Date() })
-      .where(eq(schema.requests.id, request.id));
-    await addHistory({
-      requestId: request.id,
-      status: "reminder",
-      actorKind: "system",
-      comment: `Напоминание за ${minutes} мин${result.ok ? "" : ` (ошибка доставки: ${result.error ?? "неизвестно"})`}`,
+  for (const request of requests) {
+    if (!request.driverId) continue;
+    const stops = (await getStops(request.id)).filter((s) => !s.doneAt);
+    const current = stops[0];
+    const reminderMinutes = request.reminderMinutes ?? defaultReminder;
+
+    for (const stop of stops) {
+      const planned = stop.plannedArrivalAt?.getTime();
+      if (!planned || stop.reminderSentAt || stop.arrivedAt || stopDone(stop).length) continue;
+      if (now < planned - reminderMinutes * 60_000 || now > planned + DAY_MS) continue;
+      // Отметка до отправки: при сбое доставки повторов не будет.
+      const [claimed] = await db
+        .update(schema.requestStops)
+        .set({ reminderSentAt: new Date() })
+        .where(and(eq(schema.requestStops.id, stop.id), isNull(schema.requestStops.reminderSentAt)))
+        .returning();
+      if (!claimed) continue;
+      const ctx = await loadContext(request);
+      const view = ctx.stops.find((v) => v.stop.id === stop.id);
+      if (!view) continue;
+      const left = Math.max(0, Math.round((planned - now) / 60_000));
+      const result = await notifyStaff(request.driverId, reminderMessage(ctx, view, left));
+      await addHistory({
+        requestId: request.id,
+        status: "reminder",
+        actorKind: "system",
+        stopId: stop.id,
+        comment: `Напоминание за ${reminderMinutes} мин${result.ok ? "" : ` (ошибка доставки: ${result.error ?? "неизвестно"})`}`,
+      });
+    }
+
+    // Тревога — только по текущей (первой непройденной) остановке, если она не начата.
+    const planned = current?.plannedArrivalAt?.getTime();
+    if (!current || !planned || current.lateAlertAt || current.arrivedAt || stopDone(current).length) continue;
+    if (now < planned + lateMinutes * 60_000 || now > planned + DAY_MS) continue;
+    const [claimed] = await db
+      .update(schema.requestStops)
+      .set({ lateAlertAt: new Date() })
+      .where(and(eq(schema.requestStops.id, current.id), isNull(schema.requestStops.lateAlertAt)))
+      .returning();
+    if (!claimed) continue;
+    const [driver] = await db.select().from(schema.staff).where(eq(schema.staff.id, request.driverId));
+    await raiseAlert({
+      request,
+      type: "stop_late",
+      stopId: current.id,
+      driver: driver ?? null,
+      message: `Нет отметки через ${lateMinutes} мин после планового прибытия`,
     });
   }
 }
@@ -71,8 +104,9 @@ async function runAlertEscalation() {
     await notifyDispatchers({
       text:
         `❗️ *Тревога не подтверждена ${minutes} мин*\n` +
-        `Заявка ${request?.number ?? alert.requestId} · ${alert.type === "failure" ? "Срыв заявки" : "Возможно опоздание"}\n` +
-        `Водитель: ${alert.raisedByName ?? "—"}\nПодтвердите сигнал в панели диспетчеризации.`,
+        `Заявка ${request?.number ?? alert.requestId} · ${ALERT_LABELS[alert.type] ?? alert.type}\n` +
+        (alert.raisedByName ? `Поднял: ${alert.raisedByName}\n` : "") +
+        `Подтвердите сигнал в панели диспетчеризации.`,
       format: "markdown",
     }, { event: "alert_escalation", request });
   }
@@ -80,7 +114,7 @@ async function runAlertEscalation() {
 
 async function tick() {
   try {
-    await runReminders();
+    await runStopTimers();
     await runAlertEscalation();
     await runAccessChecks();
     await purgeProcessedUpdates();

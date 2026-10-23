@@ -6,7 +6,7 @@ import { cn } from "@/lib/utils";
 import { Badge, Card, Empty } from "../components/shell";
 import { AlertBadge, StatusBadge } from "../components/status-badge";
 import { fmtDateTime, fmtRelative } from "../lib/format";
-import { formatPhone } from "../../api/lib/domain";
+import { pointKindIcon } from "../../api/lib/route-def";
 import {
   useAcknowledgeAlert,
   useOpenAlerts,
@@ -136,11 +136,10 @@ export default function Requests() {
               <thead>
                 <tr className="border-b border-border text-left text-[11px] uppercase tracking-wide text-[var(--muted-foreground)]">
                   <th className="px-4 py-2.5 font-semibold">Заявка</th>
-                  <th className="px-4 py-2.5 font-semibold">Контейнер</th>
+                  <th className="px-4 py-2.5 font-semibold">Контейнер · клиент</th>
                   <th className="px-4 py-2.5 font-semibold">Водитель</th>
                   <th className="px-4 py-2.5 font-semibold">Статус</th>
-                  <th className="px-4 py-2.5 font-semibold">Выгрузка</th>
-                  <th className="px-4 py-2.5 font-semibold">Адрес склада</th>
+                  <th className="px-4 py-2.5 font-semibold">Маршрут</th>
                 </tr>
               </thead>
               <tbody>
@@ -166,11 +165,12 @@ export default function Requests() {
                         ))}
                       </div>
                     </td>
-                    <td className="mono px-4 py-3 align-top">
-                      {row.containerNo}
+                    <td className="px-4 py-3 align-top">
+                      <div className="mono">{row.containerNo}</div>
                       <div className="text-xs text-[var(--muted-foreground)]">
-                        {row.containerType ?? "—"} · {row.cargoWeight ?? "—"}
+                        {row.containerCode ?? "—"} · {row.cargoWeightT} т
                       </div>
+                      <div className="mt-1 max-w-[220px] truncate text-xs">{row.clientName}</div>
                     </td>
                     <td className="px-4 py-3 align-top">
                       {row.driverName ?? (
@@ -185,19 +185,8 @@ export default function Requests() {
                     <td className="px-4 py-3 align-top">
                       <StatusBadge status={row.status} />
                     </td>
-                    <td className="mono px-4 py-3 align-top">
-                      {fmtDateTime(row.unloadAt)}
-                      <div
-                        className={cn(
-                          "text-xs",
-                          row.isLate ? "text-[var(--danger)]" : "text-[var(--muted-foreground)]",
-                        )}
-                      >
-                        {fmtRelative(row.unloadAt)}
-                      </div>
-                    </td>
-                    <td className="max-w-[260px] px-4 py-3 align-top text-xs text-[var(--muted-foreground)]">
-                      {row.unloadAddress ?? "—"}
+                    <td className="px-4 py-3 align-top">
+                      <RouteProgress row={row} />
                     </td>
                   </tr>
                 ))}
@@ -221,15 +210,18 @@ export default function Requests() {
                   <span className="mono text-sm font-bold text-[var(--primary)]">{row.number}</span>
                   <StatusBadge status={row.status} />
                 </div>
-                <div className="mono mt-2 text-sm">{row.containerNo}</div>
-                <div className="mt-1 text-xs text-[var(--muted-foreground)]">
-                  {row.driverName ?? "водитель не назначен"} · выгрузка {fmtDateTime(row.unloadAt)}
+                <div className="mt-2 flex items-baseline gap-2">
+                  <span className="mono text-sm">{row.containerNo}</span>
+                  <span className="text-xs text-[var(--muted-foreground)]">
+                    {row.containerCode} · {row.cargoWeightT} т
+                  </span>
                 </div>
-                {row.contactPhone && (
-                  <div className="mono mt-1 text-xs text-[var(--muted-foreground)]">
-                    {formatPhone(row.contactPhone)}
-                  </div>
-                )}
+                <div className="mt-0.5 truncate text-xs">
+                  {row.clientName} · {row.driverName ?? <span className="text-[var(--warning)]">водитель не назначен</span>}
+                </div>
+                <div className="mt-2">
+                  <RouteProgress row={row} />
+                </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {row.openAlertTypes.map((t) => (
                     <AlertBadge key={t} type={t} />
@@ -240,6 +232,57 @@ export default function Requests() {
             ))}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+type Row = NonNullable<ReturnType<typeof useRequests>["data"]>[number];
+
+/** Прогресс маршрута: полоса остановок, текущая остановка и плановое время. */
+function RouteProgress({ row }: { row: Row }) {
+  const cur = row.currentStop;
+  const finished = row.status === "done";
+  return (
+    <div className="min-w-[190px] max-w-[300px]">
+      <div className="flex gap-0.5">
+        {Array.from({ length: row.stopsTotal }, (_, i) => (
+          <span
+            key={i}
+            className={cn(
+              "h-1.5 flex-1 rounded-full",
+              i < row.stopsDone
+                ? "bg-[var(--success)]"
+                : cur && i === cur.index - 1
+                  ? row.isLate
+                    ? "bg-[var(--danger)]"
+                    : "bg-[var(--primary)]"
+                  : "bg-[var(--muted)]",
+            )}
+          />
+        ))}
+      </div>
+      {finished ? (
+        <div className="mt-1 text-xs text-[var(--muted-foreground)]">
+          Пройдено {row.stopsDone} из {row.stopsTotal}
+        </div>
+      ) : cur ? (
+        <>
+          <div className="mt-1 truncate text-xs">
+            <span className="mono text-[var(--muted-foreground)]">
+              {cur.index}/{row.stopsTotal}
+            </span>{" "}
+            {cur.pointKind && pointKindIcon(cur.pointKind)} <b className="font-semibold">{cur.pointName ?? "—"}</b>
+          </div>
+          <div className="truncate text-[11px] text-[var(--muted-foreground)]">{cur.operationName}</div>
+          {cur.plannedArrivalAt && (
+            <div className={cn("mono text-[11px]", row.isLate ? "font-semibold text-[var(--danger)]" : "text-[var(--muted-foreground)]")}>
+              {cur.arrivedAt ? `на месте с ${fmtDateTime(cur.arrivedAt)}` : `план ${fmtDateTime(cur.plannedArrivalAt)} · ${fmtRelative(cur.plannedArrivalAt)}`}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="mt-1 text-xs text-[var(--muted-foreground)]">Маршрут не задан</div>
       )}
     </div>
   );

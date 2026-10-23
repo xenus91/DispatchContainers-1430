@@ -2,14 +2,14 @@ import { useState } from "react";
 import { Link, useLocation } from "wouter";
 import { ArrowLeft, Ban, Bell, MessageSquare, Paperclip, Pencil, Send } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 import { Badge, Card, Empty, Field } from "../components/shell";
 import { AlertBadge, StatusBadge } from "../components/status-badge";
 import { errorText } from "../lib/api";
-import { fmtDateTime, fmtRelative, minutesLabel } from "../lib/format";
+import { fmtDateTime, minutesLabel } from "../lib/format";
 import { formatPhone } from "../../api/lib/domain";
-import { useStatusLabel } from "../queries/process";
-import { downloadFile, inMax, openExternal } from "../lib/miniapp";
+import { RouteTimeline, openLink } from "../components/route-timeline";
+import { mapUrl, statusLabel } from "../../api/lib/route-def";
+import { downloadFile, inMax } from "../lib/miniapp";
 import {
   useAcknowledgeAlert,
   useAddComment,
@@ -33,7 +33,6 @@ export default function RequestDetail({ id }: { id: string }) {
   const comment = useAddComment();
   const ack = useAcknowledgeAlert();
   const raise = useRaiseAlert();
-  const statusLabel = useStatusLabel();
 
   const [driverId, setDriverId] = useState("");
   const [assignNote, setAssignNote] = useState<string | null>(null);
@@ -45,9 +44,10 @@ export default function RequestDetail({ id }: { id: string }) {
   if (detail.isLoading) return <Empty text="Загружаем заявку…" />;
   if (detail.isError || !detail.data) return <Empty text={errorText(detail.error) || "Заявка не найдена"} />;
 
-  const { request: r, driver, history, attachments, alerts } = detail.data;
+  const { request: r, route, driver, history, attachments, alerts } = detail.data;
+  const stopNo = (stopId: number | null) => (stopId ? route.stops.find((x) => x.id === stopId)?.index : undefined);
   const openAlerts = alerts.filter((a) => !a.acknowledgedAt);
-  const closed = r.status === "cancelled" || r.status === "delivered";
+  const closed = r.status === "cancelled" || r.status === "done";
   const actionError = assign.error ?? cancel.error ?? resend.error ?? raise.error;
 
   return (
@@ -148,46 +148,16 @@ export default function RequestDetail({ id }: { id: string }) {
 
       <div className="grid gap-5 lg:grid-cols-3">
         <div className="space-y-5 lg:col-span-2">
-          <Card title="Данные договора-заявки">
+          <Card title="Заявка">
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <Field label="Тип заявки" value={route.typeName} />
+              <Field label="Клиент" value={route.client?.name} />
+              <Field label="Контакт клиента" value={[route.client?.contactName, formatPhone(route.client?.phone)].filter(Boolean).join(", ")} />
               <Field label="Контейнер" value={r.containerNo} mono />
-              <Field label="Тип" value={r.containerType} />
-              <Field label="Вес груза" value={r.cargoWeight} />
-              <Field label="Место погрузки" value={r.loadingPoint} />
-              <Field label="Дата рейса" value={r.tripDate} />
-              <Field label="Телефон терминала" value={formatPhone(r.terminalPhone)} mono />
+              <Field label="Тип · вес" value={`${route.containerCode ?? "—"} · ${r.cargoWeightT} т`} mono />
               <Field
-                label="Время выгрузки"
-                value={
-                  <span>
-                    {fmtDateTime(r.unloadAt)}
-                    <span
-                      className={cn(
-                        "ml-2 text-xs",
-                        !closed && r.unloadAt && new Date(r.unloadAt).getTime() < Date.now()
-                          ? "text-[var(--danger)]"
-                          : "text-[var(--muted-foreground)]",
-                      )}
-                    >
-                      {fmtRelative(r.unloadAt)}
-                    </span>
-                  </span>
-                }
-                mono
-              />
-              <Field label="Адрес склада" value={r.unloadAddress} />
-              <Field label="Координаты" value={r.coordinates} mono />
-              <Field label="Грузополучатель" value={r.consignee} />
-              <Field label="Контактное лицо" value={r.contactName} />
-              <Field label="Телефон контакта" value={formatPhone(r.contactPhone)} mono />
-              <Field label="Режим работы" value={r.schedule} />
-              <Field label="Место возврата" value={r.returnPoint} />
-              <Field label="Адрес возврата" value={r.returnAddress} />
-              <Field label="Напоминание" value={minutesLabel(r.reminderMinutes) + " до выгрузки"} />
-              <Field
-                label="Напоминание отправлено"
-                value={r.reminderSentAt ? fmtDateTime(r.reminderSentAt) : "нет"}
-                mono
+                label="Напоминание"
+                value={r.reminderMinutes ? `${minutesLabel(r.reminderMinutes)} до прибытия` : "по умолчанию"}
               />
             </div>
             {r.comment && (
@@ -200,6 +170,15 @@ export default function RequestDetail({ id }: { id: string }) {
             )}
           </Card>
 
+          <RouteTimeline
+            stops={route.stops}
+            currentStopId={route.currentStopId}
+            isLate={detail.data.isLate}
+            closed={closed}
+            attachments={attachments}
+            history={history}
+          />
+
           <Card title={`История · ${history.length}`}>
             {!history.length ? (
               <Empty text="Событий пока нет" />
@@ -211,27 +190,29 @@ export default function RequestDetail({ id }: { id: string }) {
                       {fmtDateTime(h.createdAt)}
                     </div>
                     <div className="min-w-0 flex-1 border-l border-border pl-3">
-                      <div className="text-sm font-bold">{statusLabel(h.status)}</div>
+                      <div className="text-sm font-bold">
+                        {h.status === "action" && h.comment ? h.comment : statusLabel(h.status)}
+                        {stopNo(h.stopId) && (
+                          <span className="mono ml-2 rounded bg-[var(--muted)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--muted-foreground)]">
+                            остановка {stopNo(h.stopId)}
+                          </span>
+                        )}
+                      </div>
                       <div className="text-xs text-[var(--muted-foreground)]">
                         {h.actorName ?? (h.actorKind === "system" ? "Система" : "—")}
                         {h.actorKind === "driver" && " · водитель"}
                         {h.actorKind === "dispatcher" && " · диспетчер"}
                       </div>
-                      {h.comment && <div className="mt-1 text-sm">{h.comment}</div>}
+                      {h.comment && h.status !== "action" && <div className="mt-1 text-sm">{h.comment}</div>}
                       {h.latitude != null && h.longitude != null && (
                         <a
                           className="mono mt-1 inline-block text-xs text-[var(--info)] hover:underline"
-                          href={`https://yandex.ru/maps/?pt=${h.longitude},${h.latitude}&z=16`}
+                          href={mapUrl(h.latitude, h.longitude)}
                           target="_blank"
                           rel="noreferrer"
-                          onClick={(e) => {
-                            // В мини-приложении MAX target="_blank" не работает — нужен мост.
-                            if (!inMax()) return;
-                            e.preventDefault();
-                            openExternal(`https://yandex.ru/maps/?pt=${h.longitude},${h.latitude}&z=16`);
-                          }}
+                          onClick={(e) => openLink(e, mapUrl(h.latitude!, h.longitude!))}
                         >
-                          {h.latitude.toFixed(5)}, {h.longitude.toFixed(5)}
+                          📍 {Number(h.latitude).toFixed(5)}, {Number(h.longitude).toFixed(5)}
                         </a>
                       )}
                     </div>
@@ -335,6 +316,7 @@ export default function RequestDetail({ id }: { id: string }) {
                             downloadFile(href, a.fileName ?? `attachment-${a.id}`);
                           }}
                         >
+                          {stopNo(a.stopId) ? `№${stopNo(a.stopId)} · ` : ""}
                           {a.fileName ?? a.kind}
                         </a>
                       ) : (

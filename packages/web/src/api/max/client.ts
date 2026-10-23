@@ -188,37 +188,35 @@ export async function answerCallback(
   callbackId: string,
   opts: { message?: MaxNewMessageBody; notification?: string } = {},
 ) {
+  // MAX отклоняет пустой ответ (400 proto.payload) — без подтверждения кнопка «висит».
+  const notification = opts.notification ?? (opts.message ? undefined : "Принято");
   if (isStubMode()) {
-    if (opts.message || opts.notification) {
-      await db.insert(schema.botOutbox).values({
-        text: `[answer ${callbackId}] ${opts.notification ?? ""}${opts.message?.text ? ` | ${opts.message.text}` : ""}`,
-        payloadJson: JSON.stringify(opts.message?.attachments ?? []),
-        state: "stub",
-      });
-    }
+    await db.insert(schema.botOutbox).values({
+      text: `[answer ${callbackId}] ${notification ?? ""}${opts.message?.text ? ` | ${opts.message.text}` : ""}`,
+      payloadJson: JSON.stringify(opts.message?.attachments ?? []),
+      state: "stub",
+    });
     return { ok: true, stub: true };
   }
   const body: Record<string, unknown> = {};
   if (opts.message) body.message = { format: "markdown", ...opts.message };
-  if (opts.notification) body.notification = opts.notification;
+  if (notification) body.notification = notification;
   try {
     await call("POST", "/answers", { query: { callback_id: callbackId }, body });
     return { ok: true };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
     console.error("[max] answerCallback failed:", error);
-    // Если API не принял notification — хотя бы подтверждаем нажатие/правим сообщение.
-    if (opts.notification) {
-      try {
-        const retry: Record<string, unknown> = {};
-        if (opts.message) retry.message = { format: "markdown", ...opts.message };
-        await call("POST", "/answers", { query: { callback_id: callbackId }, body: retry });
-        return { ok: true };
-      } catch {
-        /* исходная ошибка ниже */
-      }
+    // Повтор: только короткое уведомление (без правки сообщения), чтобы снять «зависание» кнопки.
+    try {
+      await call("POST", "/answers", {
+        query: { callback_id: callbackId },
+        body: { notification: notification ?? "Принято" },
+      });
+      return { ok: true, retried: true };
+    } catch {
+      return { ok: false, error };
     }
-    return { ok: false, error };
   }
 }
 

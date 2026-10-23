@@ -1,15 +1,14 @@
 import { z } from "zod";
 import { dispatcherOnly } from "../lib/auth";
-import { getNotifyPrefs, getProcess, saveNotifyPrefs } from "../lib/process";
-import { NOTIFY_GROUP_LABELS, notifyEvents } from "../lib/process-def";
+import { currentNotifyEvents, getNotifyPrefs, saveNotifyPrefs } from "../lib/route";
+import { NOTIFY_GROUP_LABELS } from "../lib/route-def";
 
 export const notifications = {
   /** Личные настройки уведомлений текущего диспетчера/админа и каталог событий. */
   get: dispatcherOnly.handler(async ({ context }) => {
-    const proc = await getProcess();
     return {
       prefs: await getNotifyPrefs(context.user.id),
-      events: notifyEvents(proc),
+      events: await currentNotifyEvents(),
       groups: NOTIFY_GROUP_LABELS,
       inBot: context.user.status === "active" && !!context.user.maxUserId,
     };

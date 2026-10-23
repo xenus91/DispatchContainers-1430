@@ -15,7 +15,8 @@ import {
   useUpdateSettings,
 } from "../queries/settings";
 
-const REMINDER_OPTIONS = [30, 60, 90, 120, 180, 240, 360, 720];
+const REMINDER_OPTIONS = [15, 30, 45, 60, 90, 120, 180, 240];
+const STOP_LATE_OPTIONS = [10, 15, 20, 30, 45, 60, 90, 120];
 const ESCALATE_OPTIONS = [5, 10, 15, 30, 60];
 const WEB_SESSION_OPTIONS = [
   { v: 4, l: "4 часа" },
@@ -87,7 +88,7 @@ function SecurityCard() {
           </div>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2">
           <label className="block">
             <span className={selectLabel}>Сеанс в браузере</span>
             <select
@@ -165,7 +166,8 @@ export default function SettingsPage() {
   const unsubscribe = useUnsubscribeWebhook();
   const [hookUrl, setHookUrl] = useState("");
 
-  const [reminderMinutes, setReminderMinutes] = useState("120");
+  const [reminderMinutes, setReminderMinutes] = useState("60");
+  const [stopLateMinutes, setStopLateMinutes] = useState("30");
   const [alertEscalateMinutes, setAlertEscalateMinutes] = useState("15");
   const [companyName, setCompanyName] = useState("");
   const [loaded, setLoaded] = useState(false);
@@ -173,6 +175,7 @@ export default function SettingsPage() {
   useEffect(() => {
     if (loaded || !settings.data) return;
     setReminderMinutes(String(settings.data.reminderMinutes));
+    setStopLateMinutes(String(settings.data.stopLateMinutes));
     setAlertEscalateMinutes(String(settings.data.alertEscalateMinutes));
     setCompanyName(settings.data.companyName);
     setLoaded(true);
@@ -196,6 +199,7 @@ export default function SettingsPage() {
             e.preventDefault();
             save.mutate({
               reminderMinutes: Number(reminderMinutes),
+              stopLateMinutes: Number(stopLateMinutes),
               alertEscalateMinutes: Number(alertEscalateMinutes),
               companyName: companyName || undefined,
             });
@@ -209,12 +213,28 @@ export default function SettingsPage() {
               <select value={reminderMinutes} onChange={(e) => setReminderMinutes(e.target.value)} className="w-full">
                 {REMINDER_OPTIONS.map((m) => (
                   <option key={m} value={m}>
-                    {minutesLabel(m)} до выгрузки
+                    {minutesLabel(m)} до прибытия
                   </option>
                 ))}
               </select>
               <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
-                Значение по умолчанию для всех заявок; в заявке можно переопределить
+                Перед каждой остановкой с плановым временем; в заявке можно переопределить
+              </span>
+            </label>
+
+            <label className="block">
+              <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+                Тревога «опаздывает» через
+              </span>
+              <select value={stopLateMinutes} onChange={(e) => setStopLateMinutes(e.target.value)} className="w-full">
+                {STOP_LATE_OPTIONS.map((m) => (
+                  <option key={m} value={m}>
+                    {minutesLabel(m)} после плана
+                  </option>
+                ))}
+              </select>
+              <span className="mt-1 block text-[11px] text-[var(--muted-foreground)]">
+                Если водитель не отметил прибытие на текущую остановку
               </span>
             </label>
 

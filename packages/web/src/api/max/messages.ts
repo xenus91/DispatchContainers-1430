@@ -1,41 +1,42 @@
 import { formatPhone } from "../lib/domain";
-import { cachedProcess } from "../lib/process";
+import type { RequestContext, StopView } from "../lib/route";
 import {
-  availableActions,
-  nextStep,
+  ALERT_LABELS,
+  type ExtraAction,
+  isClosedStatus,
+  isRunning,
+  mapUrl,
+  nextAction,
+  type OperationAction,
+  pointKindIcon,
   statusLabel,
-  type ProcessDef,
-  type ProcessStep,
-} from "../lib/process-def";
+} from "../lib/route-def";
 import { maxConfig } from "./client";
-import type * as schema from "../database/schema";
 import type { MaxButton, MaxNewMessageBody } from "./types";
-
-type RequestRow = typeof schema.requests.$inferSelect;
 
 /** Формат payload кнопок: короткий, лимит MAX — 1024 символа. */
 export const CB = {
-  status: (requestId: number, status: string) => `st:${requestId}:${status}`,
+  accept: (requestId: number) => `acc:${requestId}`,
+  /** Действие операции на остановке. Повтор по отмеченному действию — «Уже отмечено». */
+  action: (stopId: number, actionKey: string) => `a:${stopId}:${actionKey}`,
+  /** Фото к действию приложены — отметить действие */
+  actionDone: (stopId: number, actionKey: string) => `ad:${stopId}:${actionKey}`,
   comment: (requestId: number) => `cm:${requestId}`,
   photo: (requestId: number) => `ph:${requestId}`,
   alert: (requestId: number, type: string) => `al:${requestId}:${type}`,
   card: (requestId: number) => `cd:${requestId}`,
-  /** Фото к шагу приложены — выполнить переход */
-  stepDone: (requestId: number, status: string) => `sd:${requestId}:${status}`,
-  /** Подтверждение перехода «Да» */
-  stepConfirm: (requestId: number, status: string) => `sc:${requestId}:${status}`,
+  /** Свободный текст → отправить комментарием */
+  textAsComment: (requestId: number) => `tc:${requestId}`,
   nameConfirm: (yes: boolean) => `nm:${yes ? "1" : "0"}`,
   cancelInput: () => "esc",
-  /** Админ: допустить / отклонить нового сотрудника */
   approve: (staffId: number) => `ap:${staffId}`,
   reject: (staffId: number) => `rj:${staffId}`,
-  /** Сотрудник: «Это не я» — завершить все сеансы панели */
   signOutAll: () => "so",
 };
 
 export function parseCallback(payload: string | undefined) {
   const parts = (payload ?? "").split(":");
-  return { kind: parts[0] ?? "", a: parts[1] ?? "", b: parts[2] ?? "" };
+  return { kind: parts[0] ?? "", a: parts[1] ?? "", b: parts.slice(2).join(":") };
 }
 
 const tz = "Europe/Moscow";
@@ -45,7 +46,6 @@ export function formatDateTime(value: Date | null | undefined): string {
   return new Intl.DateTimeFormat("ru-RU", {
     day: "2-digit",
     month: "2-digit",
-    year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
     timeZone: tz,
@@ -54,121 +54,279 @@ export function formatDateTime(value: Date | null | undefined): string {
 
 export function formatTime(value: Date | null | undefined): string {
   if (!value) return "—";
-  return new Intl.DateTimeFormat("ru-RU", {
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: tz,
-  }).format(value);
+  return new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: tz }).format(value);
 }
 
-function line(label: string, value: string | null | undefined) {
-  return value ? `*${label}:* ${value}\n` : "";
+export const weightText = (t: number) => `${String(Math.round(t * 100) / 100).replace(".", ",")} т`;
+
+export function keyboard(buttons: MaxButton[][]): MaxNewMessageBody["attachments"] {
+  if (!buttons.length) return undefined;
+  return [{ type: "inline_keyboard", payload: { buttons } }];
 }
 
-/** Текст карточки заявки для водителя — состав полей из «Договор-заявки». */
-export function requestCardText(
-  request: RequestRow,
-  opts: { header?: string; process?: ProcessDef } = {},
-): string {
-  const process = opts.process ?? cachedProcess();
-  const header = opts.header ?? `Заявка ${request.number}`;
-  let text = `${header}\n\n`;
-  text += line("№ контейнера", request.containerNo);
-  text += line("Футовость", request.containerType);
-  text += line("Вес груза", request.cargoWeight);
-  text += line("Постановка груженого", request.loadingPoint);
-  text += line("Дата", request.tripDate);
-  text += line("Время выгрузки", request.unloadAt ? formatDateTime(request.unloadAt) : null);
-  text += line("Адрес выгрузки", request.unloadAddress);
-  text += line(
-    "Контакт",
-    request.contactName || request.contactPhone
-      ? `${request.contactName ?? ""}${request.contactPhone ? `, ${formatPhone(request.contactPhone)}` : ""}`
-      : null,
-  );
-  text += line("Грузополучатель", request.consignee);
-  text += line("Возврат порожнего", request.returnPoint);
-  text += line("Адрес возврата", request.returnAddress);
-  text += line("Координаты", request.coordinates);
-  text += line("Телефон терминала", formatPhone(request.terminalPhone) === "—" ? null : formatPhone(request.terminalPhone));
-  text += line("Режим работы", request.schedule);
-  text += line("Комментарий диспетчера", request.comment);
-  text += `\n*Текущий статус:* ${statusLabel(process, request.status)}`;
+export const plainText = (text: string): MaxNewMessageBody => ({ text, format: "markdown", attachments: [] });
 
-  const next = nextStep(process, request.status);
-  if (next?.photoRequired) {
-    text += `\n\n📷 Для шага «${next.label}» понадобится фото: ${next.photoHint}`;
+/* ─────────────── контекст ─────────────── */
+
+export function pointTitle(view: StopView | null | undefined): string {
+  if (!view?.point) return "пункт не указан";
+  return `${pointKindIcon(view.point.kind)} ${view.point.name}`;
+}
+
+/** Шапка любого сообщения по заявке: «З-2026-0007 · 2/4 · 🏭 Склад «Ромашка» · Разгрузка». */
+export function contextHeader(ctx: RequestContext, view?: StopView | null): string {
+  const v = view === undefined ? ctx.current : view;
+  if (!v) return `${ctx.request.number}${ctx.typeName ? ` · ${ctx.typeName}` : ""}`;
+  return `${ctx.request.number} · ${v.index}/${v.total} · ${pointTitle(v)} · ${v.snapshot.name}`;
+}
+
+export function containerLine(ctx: RequestContext) {
+  const r = ctx.request;
+  return `${r.containerNo} · ${ctx.containerCode ?? "—"} · ${weightText(r.cargoWeightT)}`;
+}
+
+function stopMark(ctx: RequestContext, v: StopView) {
+  if (v.stop.doneAt) return "✅";
+  if (ctx.current?.stop.id === v.stop.id && isRunning(ctx.request.status)) return "▶️";
+  return "○";
+}
+
+/** Маршрут списком с отметками и временем. */
+export function routeLines(ctx: RequestContext, photos?: Map<number, number>): string {
+  return ctx.stops
+    .map((v) => {
+      let line = `${stopMark(ctx, v)} ${v.index}. ${pointTitle(v)} — ${v.snapshot.name}`;
+      line += `\n      план ${formatDateTime(v.stop.plannedArrivalAt)}`;
+      if (v.stop.arrivedAt) line += ` · прибыл ${formatTime(v.stop.arrivedAt)}`;
+      if (v.stop.doneAt) line += ` · готово ${formatTime(v.stop.doneAt)}`;
+      const n = photos?.get(v.stop.id);
+      if (n) line += ` · 📎 ${n}`;
+      return line;
+    })
+    .join("\n");
+}
+
+function currentStopBlock(ctx: RequestContext): string {
+  const v = ctx.current;
+  if (!v) return "";
+  const p = v.point;
+  let text = `\n\n*Сейчас: ${v.index}/${v.total} · ${pointTitle(v)}*\nОперация: ${v.snapshot.name}\n`;
+  if (p?.address) text += `Адрес: ${p.address}\n`;
+  if (p?.contactName || p?.phone) {
+    text += `Контакт: ${[p.contactName, p.phone ? formatPhone(p.phone) : null].filter(Boolean).join(", ")}\n`;
   }
+  if (p?.schedule) text += `Режим работы: ${p.schedule}\n`;
+  text += `Прибытие по плану: ${formatDateTime(v.stop.plannedArrivalAt)}\n`;
+  if (p?.lat != null && p?.lon != null) text += `Карта: ${mapUrl(p.lat, p.lon)}\n`;
+  if (p?.comment) text += `Примечание: ${p.comment}\n`;
+  const next = nextAction(v.stop);
+  if (next && isRunning(ctx.request.status)) {
+    text += `\nСледующее действие: *${next.label}*`;
+    if (next.photoRequired) text += `\n📷 Понадобится фото: ${next.photoHint}`;
+  }
+  return text.trimEnd();
+}
+
+/** Текст карточки заявки для водителя. */
+export function requestCardText(ctx: RequestContext, header?: string): string {
+  const r = ctx.request;
+  let text = header ? `${header}\n\n` : "";
+  text += `*Заявка ${r.number}*${ctx.typeName ? ` · ${ctx.typeName}` : ""}\n`;
+  if (ctx.client) text += `Клиент: ${ctx.client.name}\n`;
+  text += `Контейнер: ${containerLine(ctx)}\n`;
+  text += `\n*Маршрут*\n${routeLines(ctx)}`;
+  if (!isClosedStatus(r.status)) text += currentStopBlock(ctx);
+  if (r.comment) text += `\n\n💬 Диспетчер: ${r.comment}`;
+  text += `\n\n*Статус:* ${statusLabel(r.status)}`;
+  if (r.status === "assigned" || r.status === "new") text += "\nНажмите «Принял заявку», чтобы начать рейс.";
   return text;
 }
 
-/** Клавиатура водителя: кнопка следующего шага + кнопки, разрешённые на текущем шаге. */
-export function driverKeyboard(request: RequestRow, process: ProcessDef = cachedProcess()): MaxButton[][] {
-  const actions = availableActions(process, request.status);
-  const next = nextStep(process, request.status);
+const EXTRA_BUTTONS: Record<ExtraAction, (requestId: number) => MaxButton> = {
+  photo: (id) => ({ type: "callback", text: "📷 Фото", payload: CB.photo(id) }),
+  comment: (id) => ({ type: "callback", text: "💬 Комментарий", payload: CB.comment(id) }),
+  geo: () => ({ type: "request_geo_location", text: "📍 Геолокация", quick: true }),
+  late: (id) => ({ type: "callback", text: "⏳ Опоздание", payload: CB.alert(id, "late"), intent: "negative" }),
+  failure: (id) => ({ type: "callback", text: "🚨 Срыв", payload: CB.alert(id, "failure"), intent: "negative" }),
+};
+
+/** Клавиатура водителя: следующее действие текущей остановки + доп. кнопки операции. */
+export function driverKeyboard(ctx: RequestContext): MaxButton[][] {
+  const r = ctx.request;
+  if (isClosedStatus(r.status)) return [];
+  if (r.status === "new" || r.status === "assigned") {
+    return [
+      [{ type: "callback", text: "✅ Принял заявку", payload: CB.accept(r.id), intent: "positive" }],
+      [EXTRA_BUTTONS.comment(r.id), EXTRA_BUTTONS.failure(r.id)],
+    ];
+  }
   const rows: MaxButton[][] = [];
+  const v = ctx.current;
+  if (!v) return rows;
+  const next = nextAction(v.stop);
   if (next) {
     rows.push([
       {
         type: "callback",
-        text: next.buttonText,
-        payload: CB.status(request.id, next.key),
+        text: next.photoRequired ? `${next.buttonText} 📷` : next.buttonText,
+        payload: CB.action(v.stop.id, next.key),
         intent: "positive",
       },
     ]);
   }
-  const extra: MaxButton[] = [];
-  if (actions.includes("photo")) extra.push({ type: "callback", text: "📷 Фото/скан", payload: CB.photo(request.id) });
-  if (actions.includes("comment")) {
-    extra.push({ type: "callback", text: "💬 Комментарий", payload: CB.comment(request.id) });
-  }
-  if (extra.length) rows.push(extra);
-  if (actions.includes("geo")) {
-    rows.push([{ type: "request_geo_location", text: "📍 Отправить геолокацию", quick: true }]);
-  }
-  if (actions.includes("late")) {
-    rows.push([
-      { type: "callback", text: "⏳ Возможно опоздание", payload: CB.alert(request.id, "late"), intent: "negative" },
-    ]);
-  }
-  if (actions.includes("failure")) {
-    rows.push([
-      { type: "callback", text: "🚨 Срыв заявки", payload: CB.alert(request.id, "failure"), intent: "negative" },
-    ]);
+  const extras = v.snapshot.extraActions;
+  const pick = (keys: ExtraAction[]) => keys.filter((k) => extras.includes(k)).map((k) => EXTRA_BUTTONS[k](r.id));
+  for (const row of [pick(["photo", "comment"]), pick(["geo"]), pick(["late", "failure"])]) {
+    if (row.length) rows.push(row);
   }
   return rows;
 }
 
-/** Запрос фото, без которого шаг не засчитывается. */
-export function stepPhotoPrompt(request: RequestRow, step: ProcessStep, received: number): MaxNewMessageBody {
-  const text =
-    received === 0
-      ? `📷 *${step.label}* · заявка ${request.number}\n` +
-        `Пришлите: ${step.photoHint}.\nМожно несколькими сообщениями. Когда всё отправите — нажмите «Готово».`
-      : `Принято файлов: ${received}. Пришлите ещё или нажмите «Готово», чтобы отметить «${step.label}».`;
+export function driverCardMessage(ctx: RequestContext, header?: string): MaxNewMessageBody {
+  const buttons = driverKeyboard(ctx);
+  return {
+    text: requestCardText(ctx, header),
+    // Пустой массив при правке снимает старую клавиатуру с закрытой заявки.
+    attachments: buttons.length ? keyboard(buttons) : [],
+    format: "markdown",
+    notify: true,
+  };
+}
+
+/** Запрос фото к действию. Редактируется на месте при каждом новом альбоме. */
+export function actionPhotoPrompt(
+  ctx: RequestContext,
+  view: StopView,
+  action: OperationAction,
+  received: number,
+  note?: string,
+): MaxNewMessageBody {
+  let text = `${contextHeader(ctx, view)}\n\n📷 *${action.label}*\nПришлите: ${action.photoHint}.\n`;
+  text += received
+    ? `\nПолучено файлов: *${received}*. Пришлите ещё или нажмите «Готово».`
+    : "\nПолучено файлов: 0. Можно несколькими сообщениями или альбомом.";
+  if (note) text = `${note}\n\n${text}`;
   return {
     text,
     format: "markdown",
     attachments: keyboard([
       [
-        { type: "callback", text: "✅ Готово", payload: CB.stepDone(request.id, step.key), intent: "positive" },
+        {
+          type: "callback",
+          text: received ? `✅ Готово (${received})` : "✅ Готово",
+          payload: CB.actionDone(view.stop.id, action.key),
+          intent: "positive",
+        },
         { type: "callback", text: "✖ Отмена", payload: CB.cancelInput() },
       ],
     ]),
   };
 }
 
-/** Подтверждение перехода (если включено в процессе). */
-export function stepConfirmPrompt(request: RequestRow, step: ProcessStep): MaxNewMessageBody {
+/** Ответ на свободный текст вне контекста. */
+export function freeTextPrompt(ctx: RequestContext, count: number): MaxNewMessageBody {
   return {
-    text: `Отметить «${step.label}» по заявке ${request.number}?`,
+    text:
+      `${contextHeader(ctx)}\n\n` +
+      (count > 1 ? `Сообщений: ${count}. ` : "") +
+      "Это комментарий к заявке? Диспетчер увидит его только после отправки.",
     format: "markdown",
     attachments: keyboard([
-      [
-        { type: "callback", text: "Да", payload: CB.stepConfirm(request.id, step.key), intent: "positive" },
-        { type: "callback", text: "Нет", payload: CB.cancelInput() },
-      ],
+      [{ type: "callback", text: "💬 Отправить как комментарий", payload: CB.textAsComment(ctx.request.id), intent: "positive" }],
+      [{ type: "callback", text: "📋 Показать карточку", payload: CB.card(ctx.request.id) }],
     ]),
+  };
+}
+
+/* ─────────────── уведомления диспетчерам ─────────────── */
+
+function withPanel(text: string, requestId: number): MaxNewMessageBody {
+  const open = panelButton(`request-${requestId}`, `/requests/${requestId}`);
+  return { text, format: "markdown", notify: true, ...(open ? { attachments: keyboard([[open]]) } : {}) };
+}
+
+export function actionNotification(p: {
+  ctx: RequestContext;
+  view: StopView;
+  action: OperationAction;
+  driverName: string;
+  photos?: number;
+}): MaxNewMessageBody {
+  let text = `🔔 ${contextHeader(p.ctx, p.view)}\n*${p.action.label}*\n`;
+  text += `Водитель: ${p.driverName}\nКонтейнер: ${containerLine(p.ctx)}\n`;
+  text += `План: ${formatDateTime(p.view.stop.plannedArrivalAt)} · факт: ${formatDateTime(new Date())}`;
+  if (p.photos) text += `\n📎 Приложено файлов: ${p.photos}`;
+  return withPanel(text, p.ctx.request.id);
+}
+
+export function acceptedNotification(ctx: RequestContext, driverName: string): MaxNewMessageBody {
+  const first = ctx.stops[0];
+  return withPanel(
+    `✅ *Заявка принята* · ${ctx.request.number}\nВодитель: ${driverName}\nКонтейнер: ${containerLine(ctx)}` +
+      (first ? `\nПервая остановка: ${pointTitle(first)} · план ${formatDateTime(first.stop.plannedArrivalAt)}` : ""),
+    ctx.request.id,
+  );
+}
+
+/** Итог рейса: маршрут с фактическим временем и числом фото по остановкам. */
+export function tripSummaryText(ctx: RequestContext, photos: Map<number, number>): string {
+  return `🏁 *Рейс завершён* · ${ctx.request.number}\nКонтейнер: ${containerLine(ctx)}\n\n${routeLines(ctx, photos)}`;
+}
+
+export function doneNotification(ctx: RequestContext, driverName: string, photos: Map<number, number>) {
+  return withPanel(`${tripSummaryText(ctx, photos)}\n\nВодитель: ${driverName}`, ctx.request.id);
+}
+
+export function attachmentNotification(ctx: RequestContext, view: StopView | null, driverName: string, count: number) {
+  return withPanel(`📎 ${contextHeader(ctx, view)}\n${driverName}: файлов ${count}`, ctx.request.id);
+}
+
+export function geoNotification(ctx: RequestContext, view: StopView | null, driverName: string, lat: number, lon: number) {
+  return withPanel(`📍 ${contextHeader(ctx, view)}\n${driverName}: ${lat}, ${lon}\n${mapUrl(lat, lon)}`, ctx.request.id);
+}
+
+export function commentNotification(ctx: RequestContext, view: StopView | null, driverName: string, text: string) {
+  return withPanel(`💬 ${contextHeader(ctx, view)}\n${driverName}: ${text}`, ctx.request.id);
+}
+
+export function alertNotification(p: {
+  ctx: RequestContext;
+  type: string;
+  view?: StopView | null;
+  driverName: string;
+  driverPhone?: string | null;
+  message?: string | null;
+}): MaxNewMessageBody {
+  const view = p.view === undefined ? p.ctx.current : p.view;
+  const title =
+    p.type === "failure"
+      ? "🚨🚨 СРЫВ ЗАЯВКИ"
+      : p.type === "stop_late"
+        ? "⏰ ОПАЗДЫВАЕТ НА ОСТАНОВКУ"
+        : `⏳ ${(ALERT_LABELS[p.type] ?? p.type).toUpperCase()}`;
+  let text =
+    `${title}\n━━━━━━━━━━━━━━\n${contextHeader(p.ctx, view)}\n` +
+    `Контейнер: ${containerLine(p.ctx)}\n` +
+    `Водитель: *${p.driverName}*${p.driverPhone ? ` · ${formatPhone(p.driverPhone)}` : ""}\n` +
+    `Статус: ${statusLabel(p.ctx.request.status)}`;
+  if (view) text += `\nПлан прибытия: ${formatDateTime(view.stop.plannedArrivalAt)}`;
+  if (p.message) text += `\nСообщение: ${p.message}`;
+  text += "\n━━━━━━━━━━━━━━\n❗ Требуется связь с водителем.";
+  return withPanel(text, p.ctx.request.id);
+}
+
+/** Напоминание водителю перед прибытием на остановку. */
+export function reminderMessage(ctx: RequestContext, view: StopView, minutes: number): MaxNewMessageBody {
+  const p = view.point;
+  return {
+    text:
+      `⏰ *Напоминание* · ${contextHeader(ctx, view)}\n` +
+      `Прибытие по плану: ${formatDateTime(view.stop.plannedArrivalAt)} — через ${minutes} мин.\n` +
+      (p?.address ? `Адрес: ${p.address}\n` : "") +
+      "Если не успеваете — нажмите «Опоздание» в карточке.",
+    attachments: keyboard([[{ type: "callback", text: "🗂 Открыть карточку", payload: CB.card(ctx.request.id) }]]),
+    format: "markdown",
+    notify: true,
   };
 }
 
@@ -199,25 +357,7 @@ export function panelButton(startParam?: string, path = ""): MaxButton | null {
   return openPanelButton(startParam) ?? panelLinkButton(path);
 }
 
-export function keyboard(buttons: MaxButton[][]): MaxNewMessageBody["attachments"] {
-  if (!buttons.length) return undefined;
-  return [{ type: "inline_keyboard", payload: { buttons } }];
-}
 
-export function driverCardMessage(
-  request: RequestRow,
-  header?: string,
-  process: ProcessDef = cachedProcess(),
-): MaxNewMessageBody {
-  const buttons = driverKeyboard(request, process);
-  return {
-    text: requestCardText(request, { header, process }),
-    // Пустой массив при правке снимает старую клавиатуру с закрытой заявки.
-    attachments: buttons.length ? keyboard(buttons) : [],
-    format: "markdown",
-    notify: true,
-  };
-}
 
 /** Сообщение-заглушка для тех, у кого нет доступа. */
 export const awaitingApprovalMessage: MaxNewMessageBody = {
@@ -287,77 +427,6 @@ export function nameConfirmMessage(fullName: string): MaxNewMessageBody {
       ],
     ]),
     format: "markdown",
-  };
-}
-
-/** Уведомление диспетчеру о смене статуса. */
-export function statusNotification(params: {
-  request: RequestRow;
-  status: string;
-  driverName: string;
-  comment?: string | null;
-  photos?: number;
-  process?: ProcessDef;
-}): MaxNewMessageBody {
-  const { request, status, driverName, comment, photos } = params;
-  const process = params.process ?? cachedProcess();
-  let text =
-    `🔔 *${statusLabel(process, status)}*\n` +
-    `Заявка ${request.number} · контейнер ${request.containerNo}\n` +
-    `Водитель: ${driverName}\n` +
-    `Выгрузка: ${formatDateTime(request.unloadAt)} — ${request.unloadAddress ?? "адрес не указан"}`;
-  if (comment) text += `\nКомментарий: ${comment}`;
-  if (photos) text += `\n📎 Приложено файлов: ${photos} (в карточке заявки)`;
-  const open = panelButton(`request-${request.id}`, `/requests/${request.id}`);
-  return {
-    text,
-    format: "markdown",
-    notify: true,
-    ...(open ? { attachments: keyboard([[open]]) } : {}),
-  };
-}
-
-/** Выделенное уведомление о тревоге. */
-export function alertNotification(params: {
-  request: RequestRow;
-  type: string;
-  driverName: string;
-  driverPhone?: string | null;
-  message?: string | null;
-}): MaxNewMessageBody {
-  const { request, type, driverName, driverPhone, message } = params;
-  const title = type === "failure" ? "🚨🚨 СРЫВ ЗАЯВКИ" : "⏳ ВОЗМОЖНО ОПОЗДАНИЕ";
-  let text =
-    `${title}\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `*Заявка ${request.number}* · контейнер ${request.containerNo}\n` +
-    `Водитель: *${driverName}*${driverPhone ? ` · ${formatPhone(driverPhone)}` : ""}\n` +
-    `Статус на момент сигнала: ${statusLabel(cachedProcess(), request.status)}\n` +
-    `Выгрузка: ${formatDateTime(request.unloadAt)}\n` +
-    `Адрес: ${request.unloadAddress ?? "—"}`;
-  if (message) text += `\nСообщение водителя: ${message}`;
-  text += `\n━━━━━━━━━━━━━━\n❗ Требуется экстренная связь с водителем.`;
-  const open = panelButton(`request-${request.id}`, `/requests/${request.id}`);
-  return {
-    text,
-    format: "markdown",
-    notify: true,
-    ...(open ? { attachments: keyboard([[open]]) } : {}),
-  };
-}
-
-export function reminderMessage(request: RequestRow, minutes: number): MaxNewMessageBody {
-  return {
-    text:
-      `⏰ *Напоминание*\nЗаявка ${request.number} · контейнер ${request.containerNo}\n` +
-      `До заявленного времени выгрузки (${formatDateTime(request.unloadAt)}) — ${minutes} мин.\n` +
-      `Адрес: ${request.unloadAddress ?? "—"}\n` +
-      `Текущий статус: ${statusLabel(cachedProcess(), request.status)}. Обновите статус, если он изменился.`,
-    attachments: keyboard([
-      [{ type: "callback", text: "🗂 Открыть заявку", payload: CB.card(request.id) }],
-    ]),
-    format: "markdown",
-    notify: true,
   };
 }
 

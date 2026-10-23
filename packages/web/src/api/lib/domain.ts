@@ -1,63 +1,7 @@
-/** Общий домен: статусы, тревоги, роли. Только константы — файл импортируется и фронтендом. */
+/** Общий домен: роли, доступ, настройки. Только константы — файл импортируется и фронтендом. */
 
-export const REQUEST_STATUSES = [
-  "new",
-  "assigned",
-  "accepted",
-  "en_route",
-  "container_placed",
-  "at_warehouse",
-  "delivered",
-  "cancelled",
-] as const;
-
-export type RequestStatus = (typeof REQUEST_STATUSES)[number];
-
-/** Статусы, которые переключает водитель, по порядку. */
-export const DRIVER_STATUS_FLOW = [
-  "accepted",
-  "en_route",
-  "container_placed",
-  "at_warehouse",
-  "delivered",
-] as const;
-
-export const STATUS_LABELS: Record<string, string> = {
-  new: "Новая",
-  assigned: "Назначена",
-  accepted: "Принял",
-  en_route: "В пути",
-  container_placed: "Поставил контейнер",
-  at_warehouse: "Прибыл на адрес склада",
-  delivered: "Сдал контейнер",
-  cancelled: "Отменена",
-  // служебные события истории
-  created: "Заявка создана",
-  reassigned: "Переназначена",
-  updated: "Данные изменены",
-  comment: "Комментарий",
-  attachment: "Вложение",
-  reminder: "Напоминание отправлено",
-  alert_late: "Возможно опоздание",
-  alert_failure: "Срыв заявки",
-  name_confirmed: "Регистрация подтверждена",
-};
-
-export const ACTIVE_STATUSES: RequestStatus[] = [
-  "new",
-  "assigned",
-  "accepted",
-  "en_route",
-  "container_placed",
-  "at_warehouse",
-];
-
-export const ALERT_LABELS: Record<string, string> = {
-  late: "Возможно опоздание",
-  failure: "Срыв заявки",
-  security: "Подозрительная попытка доступа",
-  no_contact: "Нет связи с водителем",
-};
+/* Статусы заявок, подписи и тревоги — в ./route-def. */
+export { ALERT_LABELS } from "./route-def";
 
 export const ROLE_LABELS: Record<string, string> = {
   admin: "Администратор",
@@ -115,8 +59,10 @@ export const INVITE_TTL_PRESETS = [
 ] as const;
 
 export const SETTINGS_DEFAULTS = {
-  /** За сколько минут до времени выгрузки напомнить водителю */
-  reminderMinutes: "120",
+  /** За сколько минут до планового прибытия на остановку напомнить водителю */
+  reminderMinutes: "60",
+  /** Через сколько минут после планового прибытия без отметки — тревога «Опаздывает на остановку» */
+  stopLateMinutes: "30",
   /** Через сколько минут неподтверждённая тревога считается просроченной */
   alertEscalateMinutes: "15",
   /** Часовой пояс для отображения времени */
@@ -132,11 +78,6 @@ export const SETTINGS_DEFAULTS = {
   /** Приостановить доступ, если сотрудник не появлялся N дней (0 — выключено) */
   inactivityDays: "30",
 } as const;
-
-export const STATUS_REQUIRES_PHOTO: Record<string, string | undefined> = {
-  container_placed: "Приложите фото акта постановки и ТН с двух сторон",
-  delivered: "Приложите фото акта сдачи и ТН с печатью/подписью старшего смены",
-};
 
 export function normalizePhone(raw: string): string {
   const digits = (raw ?? "").replace(/\D/g, "");

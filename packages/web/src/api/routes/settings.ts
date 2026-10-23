@@ -18,7 +18,8 @@ export const settings = {
   get: authed.handler(async () => {
     const map = await getSettings();
     return {
-      reminderMinutes: Number.parseInt(map.reminderMinutes ?? "120", 10) || 120,
+      reminderMinutes: Number.parseInt(map.reminderMinutes ?? "60", 10) || 60,
+      stopLateMinutes: Number.parseInt(map.stopLateMinutes ?? "30", 10) || 30,
       alertEscalateMinutes: Number.parseInt(map.alertEscalateMinutes ?? "15", 10) || 15,
       timezone: map.timezone ?? SETTINGS_DEFAULTS.timezone,
       companyName: map.companyName ?? SETTINGS_DEFAULTS.companyName,
@@ -49,12 +50,16 @@ export const settings = {
     .input(
       z.object({
         reminderMinutes: z.number().min(5).max(2880).optional(),
+        stopLateMinutes: z.number().min(5).max(1440).optional(),
         alertEscalateMinutes: z.number().min(1).max(720).optional(),
         timezone: z.string().min(3).optional(),
         companyName: z.string().min(1).optional(),
       }),
     )
     .handler(async ({ input }) => {
+      if (input.stopLateMinutes !== undefined) {
+        await setSetting("stopLateMinutes", String(input.stopLateMinutes));
+      }
       if (input.reminderMinutes !== undefined) {
         await setSetting("reminderMinutes", String(input.reminderMinutes));
       }

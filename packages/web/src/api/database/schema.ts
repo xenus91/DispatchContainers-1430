@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, index, real } from "drizzle-orm/sqlite-core";
 
 /**
  * Схема БД диспетчеризации контейнерных перевозок (MAX).
@@ -95,52 +95,138 @@ export const sessions = sqliteTable(
   (t) => [index("sessions_staff_idx").on(t.staffId)],
 );
 
-/** Заявки — состав полей из «Договор-заявки». */
+/* ─────────────── справочники ─────────────── */
+
+/** Клиенты (заказчики перевозок). */
+export const clients = sqliteTable(
+  "clients",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    name: text("name").notNull(),
+    inn: text("inn"),
+    address: text("address"),
+    contactName: text("contact_name"),
+    phone: text("phone"),
+    email: text("email"),
+    comment: text("comment"),
+    archived: integer("archived", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+  },
+  (t) => [index("clients_name_idx").on(t.name)],
+);
+
+/** Пункты маршрута: терминалы, склады, места обработки. */
+export const points = sqliteTable(
+  "points",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    /** terminal | warehouse | processing */
+    kind: text("kind").notNull(),
+    name: text("name").notNull(),
+    address: text("address"),
+    lat: real("lat"),
+    lon: real("lon"),
+    contactName: text("contact_name"),
+    phone: text("phone"),
+    /** Режим работы / перерывы */
+    schedule: text("schedule"),
+    comment: text("comment"),
+    /** Склад клиента — привязка к клиенту */
+    clientId: integer("client_id"),
+    archived: integer("archived", { mode: "boolean" }).notNull().default(false),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+    updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+  },
+  (t) => [index("points_kind_idx").on(t.kind), index("points_client_idx").on(t.clientId)],
+);
+
+/** Типы контейнеров: 20DC, 40HC … */
+export const containerTypes = sqliteTable("container_types", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  code: text("code").notNull().unique(),
+  name: text("name"),
+  sort: integer("sort").notNull().default(0),
+  archived: integer("archived", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+});
+
+/** Типы операций на остановке и действия водителя внутри них. */
+export const operationTypes = sqliteTable("operation_types", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  /** JSON: виды пунктов, где операция допустима; пусто — любые */
+  pointKindsJson: text("point_kinds_json").notNull().default("[]"),
+  /** JSON: OperationAction[] */
+  actionsJson: text("actions_json").notNull().default("[]"),
+  /** JSON: доп. кнопки водителя на остановке (photo/comment/geo/late/failure) */
+  extraActionsJson: text("extra_actions_json").notNull().default("[]"),
+  sort: integer("sort").notNull().default(0),
+  archived: integer("archived", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+});
+
+/** Типы заявок — шаблоны маршрута. */
+export const requestTypes = sqliteTable("request_types", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  description: text("description"),
+  sort: integer("sort").notNull().default(0),
+  archived: integer("archived", { mode: "boolean" }).notNull().default(false),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+});
+
+/** Остановки шаблона маршрута. */
+export const requestTypeStops = sqliteTable(
+  "request_type_stops",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    requestTypeId: integer("request_type_id").notNull(),
+    seq: integer("seq").notNull(),
+    /** «Склад клиента №1» */
+    label: text("label").notNull(),
+    pointKind: text("point_kind").notNull(),
+    operationTypeId: integer("operation_type_id").notNull(),
+    optional: integer("optional", { mode: "boolean" }).notNull().default(false),
+  },
+  (t) => [index("rts_type_idx").on(t.requestTypeId)],
+);
+
+/** Заявки: тип, клиент, контейнер и маршрут из остановок (request_stops). */
 export const requests = sqliteTable(
   "requests",
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     /** Человекочитаемый номер: З-2026-0001 */
     number: text("number").notNull().unique(),
-
+    requestTypeId: integer("request_type_id").notNull(),
+    clientId: integer("client_id").notNull(),
     containerNo: text("container_no").notNull(),
-    /** Футовость: 20DC / 40HC ... */
-    containerType: text("container_type"),
-    cargoWeight: text("cargo_weight"),
-    /** Постановка груженого */
-    loadingPoint: text("loading_point"),
-    /** Дата рейса в свободной форме: 03.09–04.09 */
-    tripDate: text("trip_date"),
-    /** Время выгрузки — основной срок, от него считается напоминание */
-    unloadAt: integer("unload_at", { mode: "timestamp" }),
-    unloadAddress: text("unload_address"),
-    /** Контакт на выгрузке */
-    contactName: text("contact_name"),
-    contactPhone: text("contact_phone"),
-    consignee: text("consignee"),
-    /** Возврат порожнего */
-    returnPoint: text("return_point"),
-    returnAddress: text("return_address"),
-    coordinates: text("coordinates"),
-    terminalPhone: text("terminal_phone"),
-    /** Режим работы / перерывы */
-    schedule: text("schedule"),
+    containerTypeId: integer("container_type_id").notNull(),
+    /** Вес груза, тонн */
+    cargoWeightT: real("cargo_weight_t").notNull(),
     comment: text("comment"),
 
-    /** new | assigned | accepted | en_route | container_placed | at_warehouse | delivered | cancelled */
+    /** new | assigned | accepted | in_progress | done | cancelled */
     status: text("status").notNull().default("new"),
     driverId: integer("driver_id"),
     createdById: integer("created_by_id"),
+    /** Тестовый рейс администратора на самого себя */
+    isTest: integer("is_test", { mode: "boolean" }).notNull().default(false),
 
-    /** Переопределение интервала напоминания (мин). null → глобальная настройка */
+    /** Переопределение «напомнить за N мин до прибытия». null → глобальная настройка */
     reminderMinutes: integer("reminder_minutes"),
-    reminderSentAt: integer("reminder_sent_at", { mode: "timestamp" }),
-
     /** id последнего отправленного водителю сообщения с карточкой — для актуализации кнопок */
     driverMessageId: text("driver_message_id"),
+    /** Текущая (первая непройденная) остановка */
+    currentStopId: integer("current_stop_id"),
 
     assignedAt: integer("assigned_at", { mode: "timestamp" }),
-    deliveredAt: integer("delivered_at", { mode: "timestamp" }),
+    acceptedAt: integer("accepted_at", { mode: "timestamp" }),
+    startedAt: integer("started_at", { mode: "timestamp" }),
+    completedAt: integer("completed_at", { mode: "timestamp" }),
     cancelledAt: integer("cancelled_at", { mode: "timestamp" }),
     cancelReason: text("cancel_reason"),
 
@@ -150,8 +236,31 @@ export const requests = sqliteTable(
   (t) => [
     index("requests_status_idx").on(t.status),
     index("requests_driver_idx").on(t.driverId),
-    index("requests_unload_idx").on(t.unloadAt),
+    index("requests_client_idx").on(t.clientId),
   ],
+);
+
+/** Остановки маршрута заявки. */
+export const requestStops = sqliteTable(
+  "request_stops",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    requestId: integer("request_id").notNull(),
+    seq: integer("seq").notNull(),
+    pointId: integer("point_id").notNull(),
+    operationTypeId: integer("operation_type_id").notNull(),
+    /** JSON: OperationSnapshot — копия операции на момент создания заявки */
+    operationSnapshotJson: text("operation_snapshot_json").notNull(),
+    plannedArrivalAt: integer("planned_arrival_at", { mode: "timestamp" }),
+    arrivedAt: integer("arrived_at", { mode: "timestamp" }),
+    doneAt: integer("done_at", { mode: "timestamp" }),
+    /** JSON: DoneAction[] — отмеченные водителем действия */
+    doneActionsJson: text("done_actions_json").notNull().default("[]"),
+    reminderSentAt: integer("reminder_sent_at", { mode: "timestamp" }),
+    lateAlertAt: integer("late_alert_at", { mode: "timestamp" }),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
+  },
+  (t) => [index("stops_request_idx").on(t.requestId)],
 );
 
 /** История статусов и событий по заявке. */
@@ -169,6 +278,9 @@ export const statusHistory = sqliteTable(
     comment: text("comment"),
     latitude: text("latitude"),
     longitude: text("longitude"),
+    /** Остановка маршрута и действие, к которым относится событие */
+    stopId: integer("stop_id"),
+    actionKey: text("action_key"),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
   },
   (t) => [index("history_request_idx").on(t.requestId)],
@@ -192,6 +304,8 @@ export const attachments = sqliteTable(
     /** Постоянная ссылка в хранилище (Tigris) */
     storedUrl: text("stored_url"),
     sizeBytes: integer("size_bytes"),
+    stopId: integer("stop_id"),
+    actionKey: text("action_key"),
     createdAt: integer("created_at", { mode: "timestamp" }).notNull().$defaultFn(now),
   },
   (t) => [index("attachments_request_idx").on(t.requestId)],
@@ -203,8 +317,9 @@ export const alerts = sqliteTable(
   {
     id: integer("id").primaryKey({ autoIncrement: true }),
     requestId: integer("request_id").notNull(),
-    /** late | failure | security | no_contact */
+    /** late | failure | security | no_contact | stop_late */
     type: text("type").notNull(),
+    stopId: integer("stop_id"),
     message: text("message"),
     raisedById: integer("raised_by_id"),
     raisedByName: text("raised_by_name"),

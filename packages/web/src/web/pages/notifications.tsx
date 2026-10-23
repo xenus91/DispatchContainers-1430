@@ -5,10 +5,10 @@ import { cn } from "@/lib/utils";
 import { Card } from "../components/shell";
 import { Toggle } from "../components/ui/toggle";
 import { errorText } from "../lib/api";
-import { useNotifications, useSaveNotifications } from "../queries/process";
-import type { NotifyEventGroup, NotifyPrefs } from "../../api/lib/process-def";
+import { useNotifications, useSaveNotifications } from "../queries/notifications";
+import type { NotifyEventGroup, NotifyPrefs } from "../../api/lib/route-def";
 
-const GROUP_ORDER: NotifyEventGroup[] = ["alert", "status", "driver", "system"];
+const GROUP_ORDER: NotifyEventGroup[] = ["alert", "request", "route", "driver", "system"];
 
 export default function NotificationsPage() {
   const q = useNotifications();
@@ -100,11 +100,17 @@ export default function NotificationsPage() {
       {grouped.map(({ group, items }) => (
         <Card key={group} title={q.data.groups[group]}>
           <ul className="divide-y divide-border">
-            {items.map((e) => {
+            {items.map((e, idx) => {
+              const sub = e.subgroup && e.subgroup !== items[idx - 1]?.subgroup ? e.subgroup : null;
               const on = e.locked ? true : !prefs.muted && isOn(e.key, e.defaultOn);
               return (
                 <li key={e.key} className="flex items-center gap-3 py-2.5 first:pt-0 last:pb-0">
                   <div className="min-w-0 flex-1">
+                    {sub && (
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+                        {sub}
+                      </div>
+                    )}
                     <div className="text-sm font-semibold">{e.label}</div>
                     {e.locked && (
                       <div className="flex items-center gap-1 text-[11px] text-[var(--muted-foreground)]">

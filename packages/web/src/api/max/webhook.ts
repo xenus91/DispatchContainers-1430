@@ -9,30 +9,38 @@ import {
   refreshDriverCard,
   reissueDriverCard,
   rememberDriverCard,
-  sendDriverCard,
 } from "../lib/notify";
-import { getProcess } from "../lib/process";
-import { availableActions, isClosedStatus, nextStep, type ProcessDef } from "../lib/process-def";
 import {
+  acceptRequest,
+  actionPhotoCount,
   activeRequestForDriver,
   addAttachment,
   addHistory,
-  applyDriverStatus,
+  applyAction,
   getRequest,
   raiseAlert,
 } from "../lib/requests-service";
-import { answerCallback, sendMessage } from "./client";
+import { loadContext, type RequestContext, type RequestRow } from "../lib/route";
+import { isClosedStatus, nextAction, type OperationAction } from "../lib/route-def";
+import { answerCallback, editMessage, sendMessage } from "./client";
+import { claimWindow, releaseWindow } from "./dedupe";
+import { extractMedia, flushMedia, type MediaBatch, messageAttachments, pushMedia, setMediaFlush } from "./media-buffer";
 import {
+  actionPhotoPrompt,
+  attachmentNotification,
   awaitingApprovalMessage,
   CB,
+  commentNotification,
   contactRequestMessage,
+  contextHeader,
   driverCardMessage,
+  freeTextPrompt,
+  geoNotification,
   keyboard,
   nameConfirmMessage,
   noAccessMessage,
   parseCallback,
-  stepConfirmPrompt,
-  stepPhotoPrompt,
+  plainText,
 } from "./messages";
 import type { MaxNewMessageBody, MaxUpdate } from "./types";
 
@@ -82,6 +90,8 @@ async function handleBotStarted(update: MaxUpdate) {
   if (!maxUserId) return;
   const chatId = update.chat_id ? String(update.chat_id) : null;
   const code = (update.payload ?? "").trim().toUpperCase();
+  // Повторный bot_started в течение минуты (двойной «Старт», переподключение) — без второго приветствия.
+  if (!(await claimWindow(`start:${maxUserId}:${code}`, 60_000))) return;
 
   const existing = await findStaffByMaxUserId(maxUserId);
   if (existing && existing.status === "active") {
@@ -245,24 +255,29 @@ async function handleNameConfirm(maxUserId: string, confirmed: boolean) {
 
 /* ─────────────── callback-кнопки ─────────────── */
 
-type RequestRow = typeof schema.requests.$inferSelect;
-
-interface StepPhotoData {
-  target: string;
-  fromStatus: string;
-  count: number;
+/** Данные шага диалога в bot_state.data_json. */
+interface StepData {
+  stopId?: number | null;
+  actionKey?: string | null;
+  /** id сообщения-запроса (редактируется на месте) */
+  mid?: string | null;
+  count?: number;
+  texts?: string[];
 }
 
-function parseData<T>(raw: string | null | undefined): Partial<T> {
+function parseData(raw: string | null | undefined): StepData {
   if (!raw) return {};
   try {
-    return JSON.parse(raw) as Partial<T>;
+    return JSON.parse(raw) as StepData;
   } catch {
     return {};
   }
 }
 
-const plain = (text: string): MaxNewMessageBody => ({ text, format: "markdown", attachments: [] });
+const plain = plainText;
+
+/** Ответ на нажатие — всегда с непустым телом (иначе MAX отвечает 400 и кнопка «висит»). */
+const ack = (callbackId: string, text = "Принято") => answerCallback(callbackId, { notification: text });
 
 /** Можно ли водителю сейчас работать с заявкой (своя и открытая). */
 function ownOpen(request: RequestRow | null, member: StaffRow): request is RequestRow {
@@ -270,74 +285,83 @@ function ownOpen(request: RequestRow | null, member: StaffRow): request is Reque
 }
 
 /**
- * Кнопка нажата на устаревшем сообщении (действие на этом шаге недоступно).
- * Если это актуальная карточка — перерисовываем её под текущий шаг, иначе
- * снимаем кнопки со старого сообщения, чтобы в чате оставалась одна клавиатура.
+ * Показать актуальную карточку: если нажали на текущей карточке — правим её на месте,
+ * иначе подтверждаем всплывашкой и перевыпускаем карточку внизу чата.
  */
-async function answerStale(
-  callbackId: string,
-  request: RequestRow,
-  pressedMid: string | undefined,
-  process: ProcessDef,
-  note = "Эта кнопка уже неактуальна",
-) {
-  const isCurrentCard = !!pressedMid && pressedMid === request.driverMessageId;
-  if (isCurrentCard || !request.driverMessageId) {
-    await answerCallback(callbackId, {
-      message: driverCardMessage(request, undefined, process),
-      notification: note,
-    });
-    if (pressedMid && !request.driverMessageId) await rememberDriverCard(request.id, pressedMid);
+async function showCard(callbackId: string, request: RequestRow, pressedMid: string | undefined, note: string) {
+  const ctx = await loadContext(request);
+  if (!request.driverMessageId || (pressedMid && pressedMid === request.driverMessageId)) {
+    await answerCallback(callbackId, { message: driverCardMessage(ctx), notification: note });
+    if (pressedMid && pressedMid !== request.driverMessageId) await rememberDriverCard(request.id, pressedMid);
     return;
   }
-  await answerCallback(callbackId, {
-    message: plain(`Заявка ${request.number}: кнопки устарели. Актуальная карточка — ниже.`),
-    notification: note,
-  });
+  await ack(callbackId, note);
   await reissueDriverCard(request);
+}
+
+/** Сообщение-запрос: правим прежнее, а если не вышло — отправляем новое и запоминаем. */
+async function upsertPrompt(maxUserId: string, member: StaffRow, mid: string | null | undefined, body: MaxNewMessageBody) {
+  if (mid) {
+    const edited = await editMessage(mid, body);
+    if (edited.ok) return mid;
+  }
+  const sent = await sendMessage({ maxUserId, staffId: member.id, body });
+  return sent.messageId ?? null;
+}
+
+async function finishTrip(maxUserId: string, member: StaffRow, request: RequestRow, summary: string | null) {
+  if (request.driverMessageId) await refreshDriverCard(request);
+  if (summary) await reply(maxUserId, member.id, { text: `${summary}\n\nСпасибо! Заявка закрыта.`, format: "markdown" });
 }
 
 async function handleCallback(update: MaxUpdate) {
   const callback = update.callback;
   if (!callback) return;
+  const id = callback.callback_id;
   const maxUserId = String(callback.user.user_id);
   const pressedMid = update.message?.body?.mid;
   const { kind, a, b } = parseCallback(callback.payload);
 
+  // Двойное нажатие той же кнопки за 5 с — только всплывашка.
+  if (!(await claimWindow(`tap:${maxUserId}:${callback.payload ?? ""}`, 5000))) {
+    await ack(id, "Уже отмечено");
+    return;
+  }
+
   if (kind === "nm") {
-    await answerCallback(callback.callback_id);
+    await ack(id);
     await handleNameConfirm(maxUserId, a === "1");
     return;
   }
 
   const member = await findStaffByMaxUserId(maxUserId);
   if (member?.status === "awaiting_approval") {
-    await answerCallback(callback.callback_id, { notification: "Ожидайте допуска администратора" });
+    await ack(id, "Ожидайте допуска администратора");
     return;
   }
   if (!member || member.status !== "active") {
     await logAccess({ kind: member ? "blocked_attempt" : "stranger", staffId: member?.id, maxUserId });
-    await answerCallback(callback.callback_id, { message: { ...noAccessMessage, attachments: [] } });
+    await answerCallback(id, { message: { ...noAccessMessage, attachments: [] } });
     return;
   }
   await touchActivity(member.id);
 
   if (kind === "so") {
     await signOutEverywhere(member, "Кнопка «Это не я» в MAX");
-    await answerCallback(callback.callback_id, {
+    await answerCallback(id, {
       message: plain("🚫 Все сеансы панели завершены. Чтобы войти снова, запросите новый код на странице входа."),
     });
     return;
   }
   if (kind === "ap" || kind === "rj") {
     if (member.role !== "admin") {
-      await answerCallback(callback.callback_id, { notification: "Доступно только администратору" });
+      await ack(id, "Доступно только администратору");
       return;
     }
     const staffId = Number.parseInt(a, 10);
     const result = kind === "ap" ? await approveStaff(staffId, member) : await rejectStaff(staffId, member);
     const who = result.ok ? `${result.member.fullName} (+${result.member.phone})` : "";
-    await answerCallback(callback.callback_id, {
+    await answerCallback(id, {
       message: plain(
         result.ok
           ? kind === "ap"
@@ -348,22 +372,27 @@ async function handleCallback(update: MaxUpdate) {
     });
     return;
   }
-
   if (kind === "esc") {
     await clearStep(maxUserId);
-    await answerCallback(callback.callback_id, { message: plain("Отменено.") });
-    return;
-  }
-  if (kind === "ok") {
-    await clearStep(maxUserId);
-    await answerCallback(callback.callback_id, { message: plain("Готово ✅ Файлы переданы в заявку.") });
+    await answerCallback(id, { message: plain("Отменено."), notification: "Отменено" });
     return;
   }
 
-  const requestId = Number.parseInt(a, 10);
-  const request = Number.isFinite(requestId) ? await getRequest(requestId) : null;
+  // a/ad адресуют остановку, остальные — заявку.
+  let request: RequestRow | null = null;
+  let stopId: number | null = null;
+  if (kind === "a" || kind === "ad") {
+    stopId = Number.parseInt(a, 10);
+    const [stop] = Number.isFinite(stopId)
+      ? await db.select().from(schema.requestStops).where(eq(schema.requestStops.id, stopId))
+      : [];
+    request = stop ? await getRequest(stop.requestId) : null;
+  } else {
+    const requestId = Number.parseInt(a, 10);
+    request = Number.isFinite(requestId) ? await getRequest(requestId) : null;
+  }
   if (!request) {
-    await answerCallback(callback.callback_id, { message: plain("Заявка не найдена.") });
+    await answerCallback(id, { message: plain("Заявка не найдена."), notification: "Устарело" });
     return;
   }
   if (request.driverId !== member.id) {
@@ -373,135 +402,100 @@ async function handleCallback(update: MaxUpdate) {
       maxUserId,
       detail: `Попытка действия по чужой заявке ${request.number}`,
     });
-    await answerCallback(callback.callback_id, { message: plain("Заявка больше не назначена на вас.") });
+    await answerCallback(id, { message: plain("Заявка больше не назначена на вас."), notification: "Устарело" });
     return;
   }
 
-  const process = await getProcess();
-  const actions = availableActions(process, request.status);
-
   switch (kind) {
     case "cd": {
-      // «Открыть заявку» из напоминания: свежая карточка внизу чата.
-      await answerCallback(callback.callback_id);
+      // Перевыдача карточки — не чаще раза в 30 с на заявку.
+      if (!(await claimWindow(`card:${request.id}`, 30_000))) {
+        await ack(id, "Карточка уже в чате ниже");
+        return;
+      }
+      await ack(id, "Карточка ниже");
       await reissueDriverCard(request);
       return;
     }
 
-    case "st": {
-      const next = nextStep(process, request.status);
-      if (!next || next.key !== b) {
-        await answerStale(callback.callback_id, request, pressedMid, process);
-        return;
-      }
-      if (next.photoRequired) {
-        await setState(maxUserId, {
-          step: "awaiting_step_photo",
-          staffId: member.id,
-          requestId: request.id,
-          dataJson: JSON.stringify({ target: next.key, fromStatus: request.status, count: 0 } satisfies StepPhotoData),
-        });
-        await answerCallback(callback.callback_id);
-        await reply(maxUserId, member.id, stepPhotoPrompt(request, next, 0));
-        return;
-      }
-      if (process.confirmTransitions) {
-        await setState(maxUserId, {
-          step: "awaiting_confirm",
-          staffId: member.id,
-          requestId: request.id,
-          dataJson: JSON.stringify({ target: next.key, fromStatus: request.status }),
-        });
-        await answerCallback(callback.callback_id);
-        await reply(maxUserId, member.id, stepConfirmPrompt(request, next));
-        return;
-      }
-
-      const result = await applyDriverStatus({ request, driver: member, status: next.key, process });
+    case "acc": {
+      const result = await acceptRequest({ request, driver: member });
       if (!result.ok) {
-        const fresh = (await getRequest(request.id)) ?? request;
-        await answerStale(callback.callback_id, fresh, pressedMid, process, result.error);
+        await ack(id, result.error);
         return;
       }
-      const isCurrentCard = !pressedMid || !request.driverMessageId || pressedMid === request.driverMessageId;
-      if (isCurrentCard) {
-        // Перерисовываем ту же карточку: новый статус и кнопки следующего шага.
-        await answerCallback(callback.callback_id, {
-          message: driverCardMessage(result.request, undefined, process),
-          notification: `Отмечено: ${next.label}`,
+      await showCard(id, result.request, pressedMid, "Заявка принята");
+      return;
+    }
+
+    case "a":
+    case "ad": {
+      if (kind === "ad") await flushMedia(maxUserId); // файлы альбома, ещё лежащие в буфере
+      const state = await getState(maxUserId);
+      const data = parseData(state?.dataJson);
+      const result = await applyAction({ request, driver: member, stopId: stopId!, actionKey: b });
+      if (!result.ok) {
+        if ("needPhoto" in result && result.needPhoto) {
+          // Нажатие не засчитано — повтор после фото не должен упираться в окно двойного нажатия.
+          await releaseWindow(`tap:${maxUserId}:${callback.payload ?? ""}`);
+          const ctx = await loadContext(request);
+          const view = ctx.stops.find((v) => v.stop.id === result.stop.id)!;
+          const sameStep =
+            state?.step === "awaiting_action_photo" && data.stopId === result.stop.id && data.actionKey === result.action.key;
+          if (kind === "ad") {
+            await answerCallback(id, {
+              message: actionPhotoPrompt(ctx, view, result.action, 0, "⚠️ Сначала пришлите хотя бы одно фото или скан."),
+              notification: "Нужно фото",
+            });
+            return;
+          }
+          if (sameStep && data.mid) {
+            await ack(id, "Пришлите фото — запрос выше");
+            return;
+          }
+          await ack(id, "Пришлите фото");
+          const mid = await upsertPrompt(maxUserId, member, null, actionPhotoPrompt(ctx, view, result.action, 0));
+          await setState(maxUserId, {
+            step: "awaiting_action_photo",
+            staffId: member.id,
+            requestId: request.id,
+            dataJson: JSON.stringify({ stopId: result.stop.id, actionKey: result.action.key, mid, count: 0 } satisfies StepData),
+          });
+          return;
+        }
+        await ack(id, result.error);
+        return;
+      }
+      if (state?.step === "awaiting_action_photo" || state?.step === "awaiting_photo") await clearStep(maxUserId);
+      const label = `Отмечено: ${result.action.label}`;
+      if (result.finishedTrip) {
+        await answerCallback(id, {
+          message: kind === "ad" ? plain(`✅ ${label}`) : driverCardMessage(result.ctx),
+          notification: "Рейс завершён",
         });
-        if (pressedMid && pressedMid !== request.driverMessageId) await rememberDriverCard(request.id, pressedMid);
-      } else {
-        await answerCallback(callback.callback_id, { message: plain(`✅ Отмечено: ${next.label}`) });
+        await finishTrip(maxUserId, member, result.request, result.summary);
+        return;
+      }
+      if (kind === "ad") {
+        await answerCallback(id, { message: plain(`✅ ${label} · файлов: ${result.view.done[result.view.done.length - 1]?.photos ?? 0}`), notification: label });
         await reissueDriverCard(result.request);
-      }
-      return;
-    }
-
-    case "sc": {
-      const state = await getState(maxUserId);
-      const next = nextStep(process, request.status);
-      if (!next || next.key !== b || state?.step !== "awaiting_confirm" || state.requestId !== request.id) {
-        await answerCallback(callback.callback_id, { message: plain("Подтверждение устарело.") });
         return;
       }
-      const result = await applyDriverStatus({ request, driver: member, status: next.key, process });
-      await clearStep(maxUserId);
-      if (!result.ok) {
-        await answerCallback(callback.callback_id, { message: plain(`Не удалось: ${result.error}`) });
-        return;
-      }
-      await answerCallback(callback.callback_id, { message: plain(`✅ Отмечено: ${next.label}`) });
-      // Карточка стоит прямо над подтверждением — обновляем её на месте.
-      if (result.request.driverMessageId) await refreshDriverCard(result.request);
-      else await sendDriverCard(result.request);
-      return;
-    }
-
-    case "sd": {
-      const state = await getState(maxUserId);
-      const data = parseData<StepPhotoData>(state?.dataJson);
-      const next = nextStep(process, request.status);
-      const step = process.steps.find((s) => s.key === b);
-      if (
-        !step ||
-        !next ||
-        next.key !== b ||
-        state?.step !== "awaiting_step_photo" ||
-        state.requestId !== request.id ||
-        data.target !== b
-      ) {
-        await answerCallback(callback.callback_id, { message: plain("Этот запрос фото устарел.") });
-        return;
-      }
-      const count = data.count ?? 0;
-      if (count < 1) {
-        const prompt = stepPhotoPrompt(request, step, 0);
-        await answerCallback(callback.callback_id, {
-          message: { ...prompt, text: `⚠️ Сначала пришлите хотя бы одно фото или скан.\n\n${prompt.text}` },
-        });
-        return;
-      }
-      const result = await applyDriverStatus({ request, driver: member, status: step.key, photos: count, process });
-      await clearStep(maxUserId);
-      if (!result.ok) {
-        await answerCallback(callback.callback_id, { message: plain(`Не удалось: ${result.error}`) });
-        return;
-      }
-      await answerCallback(callback.callback_id, { message: plain(`✅ Отмечено: ${step.label} · файлов: ${count}`) });
-      await reissueDriverCard(result.request);
+      await showCard(id, result.request, pressedMid, label);
       return;
     }
 
     case "cm": {
-      if (!actions.includes("comment")) {
-        await answerStale(callback.callback_id, request, pressedMid, process);
+      const state = await getState(maxUserId);
+      if (state?.step === "awaiting_comment" && state.requestId === request.id) {
+        await ack(id, "Напишите комментарий сообщением");
         return;
       }
+      const ctx = await loadContext(request);
       await setState(maxUserId, { step: "awaiting_comment", staffId: member.id, requestId: request.id, dataJson: null });
-      await answerCallback(callback.callback_id);
+      await ack(id, "Напишите комментарий");
       await reply(maxUserId, member.id, {
-        text: `💬 Напишите комментарий по заявке ${request.number} одним сообщением.`,
+        text: `${contextHeader(ctx)}\n\n💬 Напишите комментарий одним сообщением.`,
         format: "markdown",
         attachments: keyboard([[{ type: "callback", text: "✖ Отмена", payload: CB.cancelInput() }]]),
       });
@@ -509,100 +503,185 @@ async function handleCallback(update: MaxUpdate) {
     }
 
     case "ph": {
-      if (!actions.includes("photo")) {
-        await answerStale(callback.callback_id, request, pressedMid, process);
+      const state = await getState(maxUserId);
+      if ((state?.step === "awaiting_photo" || state?.step === "awaiting_action_photo") && state.requestId === request.id) {
+        await ack(id, "Пришлите фото — запрос выше");
         return;
       }
-      await setState(maxUserId, { step: "awaiting_photo", staffId: member.id, requestId: request.id, dataJson: null });
-      await answerCallback(callback.callback_id);
-      await reply(maxUserId, member.id, {
-        text: `📷 Пришлите фото или сканы по заявке ${request.number}. Можно несколькими сообщениями.`,
+      const ctx = await loadContext(request);
+      await ack(id, "Пришлите фото");
+      const mid = await upsertPrompt(maxUserId, member, null, {
+        text: `${contextHeader(ctx)}\n\n📷 Пришлите фото или сканы. Можно альбомом или несколькими сообщениями.`,
         format: "markdown",
-        attachments: keyboard([[{ type: "callback", text: "✖ Отмена", payload: CB.cancelInput() }]]),
+        attachments: keyboard([[{ type: "callback", text: "✖ Закрыть", payload: CB.cancelInput() }]]),
+      });
+      await setState(maxUserId, {
+        step: "awaiting_photo",
+        staffId: member.id,
+        requestId: request.id,
+        dataJson: JSON.stringify({ stopId: ctx.current?.stop.id ?? null, mid, count: 0 } satisfies StepData),
       });
       return;
     }
 
     case "al": {
       const type = b === "failure" ? "failure" : "late";
-      if (!actions.includes(type)) {
-        await answerStale(callback.callback_id, request, pressedMid, process);
+      const { duplicate } = await raiseAlert({ request, type, raisedBy: member });
+      await ack(id, duplicate ? "Сигнал уже передан" : "Сигнал отправлен диспетчеру");
+      if (!duplicate) {
+        await reply(maxUserId, member.id, {
+          text:
+            type === "failure"
+              ? "🚨 Сигнал «Срыв заявки» отправлен диспетчеру. Ожидайте звонка."
+              : "⏳ Сигнал «Возможно опоздание» отправлен диспетчеру.",
+          format: "markdown",
+        });
+      }
+      return;
+    }
+
+    case "tc": {
+      const state = await getState(maxUserId);
+      const data = parseData(state?.dataJson);
+      if (state?.step !== "free_text" || state.requestId !== request.id || !data.texts?.length) {
+        await ack(id, "Устарело");
         return;
       }
-      const { duplicate } = await raiseAlert({ request, type, raisedBy: member });
-      await answerCallback(callback.callback_id, {
-        notification: duplicate ? "Сигнал уже передан" : "Сигнал отправлен диспетчеру",
-      });
-      await reply(maxUserId, member.id, {
-        text: duplicate
-          ? "Этот сигнал уже передан диспетчеру и ещё не обработан. Ожидайте звонка."
-          : type === "failure"
-            ? "🚨 Сигнал «Срыв заявки» отправлен диспетчеру. Ожидайте звонка."
-            : "⏳ Сигнал «Возможно опоздание» отправлен диспетчеру.",
-        format: "markdown",
+      const text = data.texts.join("\n");
+      const ctx = await loadContext(request);
+      await saveComment(ctx, member, text);
+      await clearStep(maxUserId);
+      await answerCallback(id, {
+        message: plain(`💬 ${contextHeader(ctx)}\nКомментарий передан диспетчеру.`),
+        notification: "Отправлено",
       });
       return;
     }
 
     default:
-      await answerCallback(callback.callback_id, { notification: "Команда не распознана" });
+      await ack(id, "Команда не распознана");
   }
 }
 
 /* ─────────────── входящие сообщения ─────────────── */
 
-const DOC_TYPES = ["image", "photo", "file"];
-const MEDIA_TYPES = ["image", "photo", "video", "file", "audio"];
+async function saveComment(ctx: RequestContext, member: StaffRow, text: string) {
+  await addHistory({
+    requestId: ctx.request.id,
+    status: "comment",
+    actorKind: "driver",
+    actorId: member.id,
+    actorName: member.fullName,
+    comment: text,
+    stopId: ctx.current?.stop.id ?? null,
+  });
+  await notifyDispatchers(commentNotification(ctx, ctx.current, member.fullName, text), {
+    event: "comment",
+    request: ctx.request,
+    excludeStaffId: member.id,
+  });
+}
 
-async function saveMedia(
-  update: MaxUpdate,
-  member: StaffRow,
-  requestId: number,
-  types: string[],
-  note?: string,
-) {
-  const media = (update.message?.body?.attachments ?? []).filter((a) => types.includes(a.type));
-  if (!media.length) return 0;
-  const caption = update.message?.body?.text?.trim() || null;
+/** Заявка, к которой относится сообщение: из шага диалога или активная. */
+async function targetRequest(member: StaffRow, state: Awaited<ReturnType<typeof getState>>) {
+  const fromState = state?.requestId ? await getRequest(state.requestId) : null;
+  if (ownOpen(fromState, member)) return { request: fromState, fromState: true };
+  return { request: canExecute(member.role) ? await activeRequestForDriver(member.id) : null, fromState: false };
+}
+
+/**
+ * Пачка медиа (альбом или серия за 2,5 с): одна запись истории, один ответ водителю,
+ * одно уведомление диспетчерам. Привязка — к действию из запроса фото или к текущей остановке.
+ */
+async function flushMediaBatch(batch: MediaBatch) {
+  const maxUserId = batch.maxUserId;
+  const member = await findStaffByMaxUserId(maxUserId);
+  if (!member || member.status !== "active") return;
+  const state = await getState(maxUserId);
+  const { request, fromState } = await targetRequest(member, state);
+
+  if (!request) {
+    await reply(maxUserId, member.id, plain("Нет активной заявки — файлы не сохранены."));
+    return;
+  }
+  const ctx = await loadContext(request);
+  if (!batch.items.length) {
+    await reply(maxUserId, member.id, plain(`${contextHeader(ctx)}\n\nНе удалось распознать вложение. Пришлите фото как изображение или файл.`));
+    return;
+  }
+
+  const data = fromState ? parseData(state?.dataJson) : {};
+  let view = ctx.current;
+  let action: OperationAction | null = null;
+  if (fromState && state?.step === "awaiting_action_photo" && data.stopId && data.actionKey) {
+    const v = ctx.stops.find((s) => s.stop.id === data.stopId);
+    const next = v ? nextAction(v.stop) : null;
+    if (v && next?.key === data.actionKey && ctx.current?.stop.id === v.stop.id) {
+      view = v;
+      action = next;
+    }
+  } else if (fromState && state?.step === "awaiting_photo" && data.stopId) {
+    view = ctx.stops.find((s) => s.stop.id === data.stopId) ?? view;
+  }
+
+  const note = action ? `К действию «${action.label}»` : "Доп. фото";
   const history = await addHistory({
-    requestId,
+    requestId: request.id,
     status: "attachment",
     actorKind: "driver",
     actorId: member.id,
     actorName: member.fullName,
-    comment: [note, caption].filter(Boolean).join(" · ") || null,
+    comment: [note, ...batch.captions].join(" · "),
+    stopId: view?.stop.id ?? null,
+    actionKey: action?.key ?? null,
   });
-  for (const item of media) {
+  for (const item of batch.items) {
     await addAttachment({
-      requestId,
+      requestId: request.id,
       historyId: history?.id ?? null,
       uploadedById: member.id,
-      kind: item.type === "photo" ? "image" : item.type,
-      fileName: item.filename ?? null,
-      maxToken: (item.payload?.token as string | undefined) ?? null,
-      maxUrl: (item.payload?.url as string | undefined) ?? null,
-      sizeBytes: item.size ?? null,
+      kind: item.type,
+      fileName: item.fileName,
+      maxToken: item.token,
+      maxUrl: item.url,
+      sizeBytes: item.size,
+      stopId: view?.stop.id ?? null,
+      actionKey: action?.key ?? null,
     });
   }
-  return media.length;
+  const n = batch.items.length;
+
+  if (action && view) {
+    const count = await actionPhotoCount(view.stop.id, action.key);
+    const mid = await upsertPrompt(maxUserId, member, data.mid, actionPhotoPrompt(ctx, view, action, count));
+    await setState(maxUserId, { dataJson: JSON.stringify({ ...data, mid, count } satisfies StepData) });
+  } else if (fromState && state?.step === "awaiting_photo") {
+    const count = (data.count ?? 0) + n;
+    const mid = await upsertPrompt(maxUserId, member, data.mid, {
+      text: `📎 ${contextHeader(ctx, view)}\nПринято файлов: *${count}*. Можно прислать ещё.`,
+      format: "markdown",
+      attachments: keyboard([[{ type: "callback", text: "✅ Готово", payload: CB.cancelInput(), intent: "positive" }]]),
+    });
+    await setState(maxUserId, { dataJson: JSON.stringify({ ...data, mid, count } satisfies StepData) });
+  } else {
+    await reply(maxUserId, member.id, plain(`📎 ${n} ${n === 1 ? "файл" : "файлов"} → ${contextHeader(ctx, view)}`));
+  }
+
+  await notifyDispatchers(attachmentNotification(ctx, view, member.fullName, n), {
+    event: "attachment",
+    request,
+    excludeStaffId: member.id,
+  });
 }
 
-async function notifyAttachment(request: RequestRow, member: StaffRow, count: number) {
-  await notifyDispatchers(
-    {
-      text: `📎 *Вложения по заявке ${request.number}*\nВодитель: ${member.fullName}\nФайлов: ${count}`,
-      format: "markdown",
-    },
-    { event: "attachment", request, excludeStaffId: member.id },
-  );
-}
+setMediaFlush(flushMediaBatch);
 
 async function handleMessage(update: MaxUpdate) {
   const maxUserId = String(update.message?.sender?.user_id ?? "");
   if (!maxUserId) return;
 
-  const hasContact = update.message?.body?.attachments?.some((a) => a.type === "contact");
-  if (hasContact) {
+  const attachments = messageAttachments(update);
+  if (attachments.some((a) => a.type === "contact")) {
     await handleContact(update, maxUserId);
     return;
   }
@@ -629,117 +708,81 @@ async function handleMessage(update: MaxUpdate) {
   }
 
   await touchActivity(member.id);
-  const process = await getProcess();
-  const state = await getState(maxUserId);
   const text = (update.message?.body?.text ?? "").trim();
-  const attachments = update.message?.body?.attachments ?? [];
-  const stateRequest = state?.requestId ? await getRequest(state.requestId) : null;
-  const stateValid = ownOpen(stateRequest, member);
-  if (state && state.step !== "idle" && state.requestId && !stateValid) {
+
+  /* — медиа: в буфер, ответ один на пачку (никогда не перевыпускает карточку) — */
+  const { items, unknownTypes } = extractMedia(attachments);
+  if (items.length || unknownTypes.length) {
+    pushMedia(maxUserId, { items, caption: text || null, unknown: !items.length });
+    return;
+  }
+
+  const state = await getState(maxUserId);
+  const { request, fromState } = await targetRequest(member, state);
+  if (state && state.step !== "idle" && state.requestId && !fromState) {
     // Заявку закрыли/переназначили, пока водитель отвечал.
     await clearStep(maxUserId);
   }
 
-  /* — фото к шагу, без которого переход не засчитывается — */
-  if (state?.step === "awaiting_step_photo" && stateValid) {
-    const data = parseData<StepPhotoData>(state.dataJson);
-    const step = process.steps.find((s) => s.key === data.target);
-    const stillNext = step && nextStep(process, stateRequest.status)?.key === step.key;
-    if (!step || !stillNext || data.fromStatus !== stateRequest.status) {
-      await clearStep(maxUserId);
-    } else {
-      const saved = await saveMedia(update, member, stateRequest.id, DOC_TYPES, `К шагу «${step.label}»`);
-      if (saved) {
-        const count = (data.count ?? 0) + saved;
-        await setState(maxUserId, { dataJson: JSON.stringify({ ...data, count } satisfies Partial<StepPhotoData>) });
-        await reply(maxUserId, member.id, stepPhotoPrompt(stateRequest, step, count));
-        return;
-      }
-      const prompt = stepPhotoPrompt(stateRequest, step, data.count ?? 0);
-      await reply(maxUserId, member.id, {
-        ...prompt,
-        text: `Нужно фото или скан документа (картинка или файл).\n\n${prompt.text}`,
-      });
-      return;
-    }
-  }
-
-  /* — геолокация — */
+  /* — геолокация: к текущей остановке — */
   const geo = attachments.find((a) => a.type === "location");
   if (geo) {
-    const target = stateValid ? stateRequest : await activeRequestForDriver(member.id);
-    if (target) {
-      await addHistory({
-        requestId: target.id,
-        status: "comment",
-        actorKind: "driver",
-        actorId: member.id,
-        actorName: member.fullName,
-        comment: "Геолокация водителя",
-        latitude: String(geo.payload?.latitude ?? ""),
-        longitude: String(geo.payload?.longitude ?? ""),
-      });
-      await notifyDispatchers(
-        {
-          text:
-            `📍 *Геолокация по заявке ${target.number}*\n` +
-            `${member.fullName}: ${geo.payload?.latitude}, ${geo.payload?.longitude}`,
-          format: "markdown",
-        },
-        { event: "geo", request: target, excludeStaffId: member.id },
-      );
-      await reply(maxUserId, member.id, { text: "Геолокация сохранена в заявке.", format: "markdown" });
+    if (!request) {
+      await reply(maxUserId, member.id, plain("Нет активной заявки — геолокация не сохранена."));
       return;
     }
-  }
-
-  /* — произвольные вложения: по запросу «Фото/скан» или без запроса к активной заявке — */
-  const hasMedia = attachments.some((a) => MEDIA_TYPES.includes(a.type));
-  if (hasMedia && canExecute(member.role)) {
-    const target =
-      state?.step === "awaiting_photo" && stateValid ? stateRequest : await activeRequestForDriver(member.id);
-    if (target) {
-      const saved = await saveMedia(update, member, target.id, MEDIA_TYPES);
-      if (saved) {
-        await notifyAttachment(target, member, saved);
-        await reply(maxUserId, member.id, {
-          text: `Принято файлов: ${saved} · заявка ${target.number}.`,
-          format: "markdown",
-          ...(state?.step === "awaiting_photo"
-            ? { attachments: keyboard([[{ type: "callback", text: "✅ Готово", payload: "ok", intent: "positive" }]]) }
-            : {}),
-        });
-        return;
-      }
-    }
-  }
-
-  /* — комментарий — */
-  if (state?.step === "awaiting_comment" && stateValid && text) {
+    const lat = Number(geo.payload?.latitude);
+    const lon = Number(geo.payload?.longitude);
+    const ctx = await loadContext(request);
     await addHistory({
-      requestId: stateRequest.id,
-      status: "comment",
+      requestId: request.id,
+      status: "geo",
       actorKind: "driver",
       actorId: member.id,
       actorName: member.fullName,
-      comment: text,
+      comment: "Геолокация водителя",
+      latitude: String(lat),
+      longitude: String(lon),
+      stopId: ctx.current?.stop.id ?? null,
     });
-    await notifyDispatchers(
-      {
-        text: `💬 *Комментарий по заявке ${stateRequest.number}*\n${member.fullName}: ${text}`,
-        format: "markdown",
-      },
-      { event: "comment", request: stateRequest, excludeStaffId: member.id },
-    );
-    await clearStep(maxUserId);
-    await reply(maxUserId, member.id, { text: "Комментарий передан диспетчеру.", format: "markdown" });
+    await notifyDispatchers(geoNotification(ctx, ctx.current, member.fullName, lat, lon), {
+      event: "geo",
+      request,
+      excludeStaffId: member.id,
+    });
+    await reply(maxUserId, member.id, plain(`📍 Геолокация сохранена → ${contextHeader(ctx)}`));
     return;
   }
 
-  // Свободный текст без контекста: одна актуальная карточка внизу чата или подсказка.
-  const active = canExecute(member.role) ? await activeRequestForDriver(member.id) : null;
-  if (active) {
-    await reissueDriverCard(active, `Ваша активная заявка ${active.number}`);
+  if (!text) return;
+
+  /* — комментарий по кнопке «💬» — */
+  if (state?.step === "awaiting_comment" && fromState && request) {
+    const ctx = await loadContext(request);
+    await saveComment(ctx, member, text);
+    await clearStep(maxUserId);
+    await reply(maxUserId, member.id, plain(`💬 ${contextHeader(ctx)}\nКомментарий передан диспетчеру.`));
+    return;
+  }
+
+  /* — ждём фото к действию, а пришёл текст — */
+  if (state?.step === "awaiting_action_photo" && fromState && request) {
+    await reply(maxUserId, member.id, plain("Жду фото или скан. Пришлите файл или нажмите «Отмена» в запросе выше."));
+    return;
+  }
+
+  /* — свободный текст: один вопрос «это комментарий?», правится на месте — */
+  if (request) {
+    const ctx = await loadContext(request);
+    const data = state?.step === "free_text" && state.requestId === request.id ? parseData(state.dataJson) : {};
+    const texts = [...(data.texts ?? []), text].slice(-20);
+    const mid = await upsertPrompt(maxUserId, member, data.mid, freeTextPrompt(ctx, texts.length));
+    await setState(maxUserId, {
+      step: "free_text",
+      staffId: member.id,
+      requestId: request.id,
+      dataJson: JSON.stringify({ texts, mid } satisfies StepData),
+    });
     return;
   }
   await reply(maxUserId, member.id, {

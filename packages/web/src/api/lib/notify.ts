@@ -4,14 +4,12 @@ import * as schema from "../database/schema";
 import { editMessage, sendMessage } from "../max/client";
 import { driverCardMessage } from "../max/messages";
 import type { MaxNewMessageBody } from "../max/types";
-import { getNotifyPrefsMap, getProcess } from "./process";
-import { isEventEnabled, isLockedEvent, type ProcessDef } from "./process-def";
-
-type RequestRow = typeof schema.requests.$inferSelect;
+import { currentNotifyEvents, getNotifyPrefsMap, loadContext, type RequestRow } from "./route";
+import { isEventEnabled, isLockedEvent, type NotifyEvent } from "./route-def";
 
 export interface NotifyOptions {
   /**
-   * Ключ события: `status:<шаг>`, `comment`, `attachment`, `geo`, `alert_late`,
+   * Ключ события: `accepted`, `done`, `op:<операция>:<действие>`, `comment`, `attachment`, `geo`, `alert_late`,
    * `alert_failure`, `alert_escalation`, `security`, `staff_activated`.
    * Каждый диспетчер/админ сам решает в панели, какие события получать.
    */
@@ -22,8 +20,8 @@ export interface NotifyOptions {
 }
 
 /** Кому из диспетчеров/админов нужно это событие с учётом их личных настроек. */
-export async function dispatcherRecipients(opts: NotifyOptions, process?: ProcessDef) {
-  const proc = process ?? (await getProcess());
+export async function dispatcherRecipients(opts: NotifyOptions, catalog?: NotifyEvent[]) {
+  const events = catalog ?? (await currentNotifyEvents());
   const people = await db
     .select()
     .from(schema.staff)
@@ -34,9 +32,9 @@ export async function dispatcherRecipients(opts: NotifyOptions, process?: Proces
     if (opts.excludeStaffId && person.id === opts.excludeStaffId) return false;
     const p = prefs.get(person.id);
     if (!p) return true;
-    if (!isEventEnabled(proc, p, opts.event)) return false;
+    if (!isEventEnabled(events, p, opts.event)) return false;
     // «Только мои заявки»: фильтр по автору заявки. Заблокированные (критичные) тревоги — всем.
-    if (!isLockedEvent(proc, opts.event) && p.scope === "mine" && opts.request && opts.request.createdById != null) {
+    if (!isLockedEvent(events, opts.event) && p.scope === "mine" && opts.request && opts.request.createdById != null) {
       return opts.request.createdById === person.id;
     }
     return true;
@@ -67,11 +65,10 @@ export async function sendDriverCard(request: RequestRow, header?: string) {
     return { ok: false, error: "Водитель не активирован в боте MAX" };
   }
 
-  const process = await getProcess();
   const result = await sendMessage({
     maxUserId: driver.maxUserId,
     staffId: driver.id,
-    body: driverCardMessage(request, header, process),
+    body: driverCardMessage(await loadContext(request), header),
   });
   if (result.messageId) {
     await db
@@ -85,8 +82,7 @@ export async function sendDriverCard(request: RequestRow, header?: string) {
 /** Обновить ранее отправленную карточку (актуализировать статус и кнопки). */
 export async function refreshDriverCard(request: RequestRow, header?: string) {
   if (!request.driverMessageId) return { ok: true, skipped: true };
-  const process = await getProcess();
-  return editMessage(request.driverMessageId, driverCardMessage(request, header, process));
+  return editMessage(request.driverMessageId, driverCardMessage(await loadContext(request), header));
 }
 
 /**

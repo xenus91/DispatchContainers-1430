@@ -5,12 +5,15 @@ import { auth } from "./routes/auth";
 import { staff } from "./routes/staff";
 import { requests } from "./routes/requests";
 import { settings } from "./routes/settings";
-import { process as processRoute } from "./routes/process";
+import { clients } from "./routes/clients";
+import { points } from "./routes/points";
+import { containerTypes } from "./routes/container-types";
+import { operationTypes } from "./routes/operation-types";
+import { requestTypes } from "./routes/request-types";
 import { notifications } from "./routes/notifications";
 import { sessions } from "./routes/sessions";
 import { ensureSeedAdmin } from "./lib/auth";
 import { startScheduler } from "./lib/scheduler";
-import { getProcess } from "./lib/process";
 import { maxConfig } from "./max/client";
 import { claimUpdate } from "./max/dedupe";
 import { handleUpdate } from "./max/webhook";
@@ -27,7 +30,11 @@ export const router = {
   requests,
   settings,
   sessions,
-  process: processRoute,
+  clients,
+  points,
+  containerTypes,
+  operationTypes,
+  requestTypes,
   notifications,
 };
 
@@ -61,7 +68,6 @@ app.post("/api/webhooks/max", async (c) => {
 });
 
 void ensureSeedAdmin().catch((err) => console.error("[seed admin]", err));
-void getProcess().catch((err) => console.error("[process]", err));
 startScheduler();
 
 // Разработка/тестирование без публичного HTTPS: события бота забираем long polling.

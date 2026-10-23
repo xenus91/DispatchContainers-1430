@@ -14,7 +14,7 @@ import Staff from "./pages/staff";
 import SessionsPage from "./pages/sessions";
 import SettingsPage from "./pages/settings";
 import NotificationsPage from "./pages/notifications";
-import ProcessPage from "./pages/process";
+import DictPage from "./pages/dict";
 
 function Routes() {
   const me = useMe();
@@ -31,7 +31,8 @@ function Routes() {
   // Внутри MAX сначала пробуем автовход по initData, в браузере — телефон + код.
   if (!me.data) return inMax() ? <MaxLogin /> : <Login />;
 
-  const isAdmin = me.data.role === "admin";
+  const user = me.data;
+  const isAdmin = user.role === "admin";
 
   return (
     <Shell me={me.data}>
@@ -43,9 +44,10 @@ function Routes() {
         <Route path="/requests/:id">{(p) => <RequestDetail id={p.id} />}</Route>
         <Route path="/staff">{() => (isAdmin ? <Staff /> : <Redirect to="/" />)}</Route>
         <Route path="/settings">{() => (isAdmin ? <SettingsPage /> : <Redirect to="/" />)}</Route>
-        <Route path="/process">{() => (isAdmin ? <ProcessPage /> : <Redirect to="/" />)}</Route>
+        <Route path="/dict/:section">{(p) => <DictPage section={p.section} />}</Route>
+        <Route path="/dict">{() => <Redirect to="/dict/clients" />}</Route>
         <Route path="/sessions" component={SessionsPage} />
-        <Route path="/notifications">{() => (me.data.role !== "driver" ? <NotificationsPage /> : <Redirect to="/" />)}</Route>
+        <Route path="/notifications">{() => (user.role !== "driver" ? <NotificationsPage /> : <Redirect to="/" />)}</Route>
         <Route>
           <Redirect to="/" />
         </Route>

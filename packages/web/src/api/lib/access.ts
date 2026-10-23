@@ -8,7 +8,7 @@ import type { MaxNewMessageBody } from "../max/types";
 import { logAccess, revokeSessions, type StaffRow } from "./auth";
 import { notifyDispatchers, sendDriverCard } from "./notify";
 import { canExecute } from "./domain";
-import { CLOSED_STATUSES } from "./process-def";
+import { CLOSED_STATUSES } from "./route-def";
 import { activeRequestForDriver } from "./requests-service";
 import { getSetting } from "./settings";
 

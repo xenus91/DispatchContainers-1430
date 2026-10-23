@@ -19,11 +19,15 @@ export async function getSetting(key: keyof typeof SETTINGS_DEFAULTS | string): 
   return (SETTINGS_DEFAULTS as SettingsMap)[key] ?? "";
 }
 
-export async function getReminderMinutes(): Promise<number> {
-  const raw = await getSetting("reminderMinutes");
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120;
+async function getMinutes(key: string, fallback: number): Promise<number> {
+  const parsed = Number.parseInt(await getSetting(key), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
+
+/** За сколько минут до планового прибытия напомнить водителю (по умолчанию 60). */
+export const getReminderMinutes = () => getMinutes("reminderMinutes", 60);
+/** Через сколько минут опоздания поднять тревогу по остановке (по умолчанию 30). */
+export const getStopLateMinutes = () => getMinutes("stopLateMinutes", 30);
 
 export async function setSetting(key: string, value: string) {
   await db

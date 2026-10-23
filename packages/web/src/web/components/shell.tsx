@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { AlertTriangle, Bell, LogOut, Package, Settings, ShieldCheck, Users, Workflow } from "lucide-react";
+import { AlertTriangle, Bell, LogOut, Package, Settings, ShieldCheck, Users, BookOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useLogout, useMe } from "../queries/auth";
 import { useOpenAlerts, useStats } from "../queries/requests";
@@ -60,14 +60,12 @@ function NavLinks({ path, isAdmin, mobile }: { path: string; isAdmin: boolean; m
           label="Сотрудники"
         />
       )}
-      {isAdmin && (
-        <NavLink
-          href="/process"
-          active={path.startsWith("/process")}
-          icon={<Workflow className="size-4" />}
-          label="Процесс"
-        />
-      )}
+      <NavLink
+        href="/dict/clients"
+        active={path.startsWith("/dict")}
+        icon={<BookOpen className="size-4" />}
+        label="Справочники"
+      />
       <NavLink
         href="/notifications"
         active={path.startsWith("/notifications")}
