@@ -12,6 +12,7 @@ import { operationTypes } from "./routes/operation-types";
 import { requestTypes } from "./routes/request-types";
 import { notifications } from "./routes/notifications";
 import { sessions } from "./routes/sessions";
+import { mountCron } from "./routes/cron";
 import { ensureSeedAdmin } from "./lib/auth";
 import { startScheduler } from "./lib/scheduler";
 import { maxConfig } from "./max/client";
@@ -43,6 +44,7 @@ export type AppRouter = typeof router;
 export type AppRouterClient = RouterClient<AppRouter>;
 
 const app = createApp(router);
+mountCron(app);
 
 /** MAX Bot API webhook — subscribed via POST /subscriptions on botapi.max.ru. */
 app.post("/api/webhooks/max", async (c) => {

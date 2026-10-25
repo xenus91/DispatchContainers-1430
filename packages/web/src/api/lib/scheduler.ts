@@ -2,7 +2,7 @@ import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { db } from "../database";
 import * as schema from "../database/schema";
 import { reminderMessage } from "../max/messages";
-import { purgeProcessedUpdates } from "../max/dedupe";
+import { claimWindow, purgeProcessedUpdates } from "../max/dedupe";
 import { runAccessChecks } from "./access";
 import { notifyDispatchers, notifyStaff } from "./notify";
 import { addHistory, raiseAlert } from "./requests-service";
@@ -13,8 +13,6 @@ import { getReminderMinutes, getSetting, getStopLateMinutes } from "./settings";
 const TICK_MS = 60_000;
 const DAY_MS = 86_400_000;
 
-/** Уже отправленные повторные пинги по неподтверждённым тревогам. */
-const escalated = new Set<number>();
 
 /**
  * По остановкам маршрута: напоминание водителю за N минут до планового прибытия
@@ -94,13 +92,13 @@ async function runAlertEscalation() {
 
   const open = await db.select().from(schema.alerts).where(isNull(schema.alerts.acknowledgedAt));
   for (const alert of open) {
-    if (escalated.has(alert.id)) continue;
     if (Date.now() - alert.createdAt.getTime() < minutes * 60_000) continue;
+    // Отметка в БД, а не в памяти: процесс может перезапускаться — повторного пинга не будет.
+    if (!(await claimWindow(`esc:${alert.id}`, 3 * DAY_MS))) continue;
     const [request] = await db
       .select()
       .from(schema.requests)
       .where(eq(schema.requests.id, alert.requestId));
-    escalated.add(alert.id);
     await notifyDispatchers({
       text:
         `❗️ *Тревога не подтверждена ${minutes} мин*\n` +
@@ -110,6 +108,21 @@ async function runAlertEscalation() {
       format: "markdown",
     }, { event: "alert_escalation", request });
   }
+}
+
+let running: Promise<void> | null = null;
+
+/**
+ * Один проход планировщика. Вызывается таймером процесса, внешним cron (/api/cron/tick)
+ *. Параллельные вызовы склеиваются,
+ * а все отметки (напоминание, тревога, эскалация) захватываются в БД — повторов нет.
+ */
+export function runSchedulerTick(): Promise<void> {
+  if (running) return running;
+  running = tick().finally(() => {
+    running = null;
+  });
+  return running;
 }
 
 async function tick() {
@@ -127,7 +140,7 @@ async function tick() {
 export function startScheduler() {
   const g = globalThis as unknown as { __maxDispatchScheduler?: ReturnType<typeof setInterval> };
   if (g.__maxDispatchScheduler) return;
-  g.__maxDispatchScheduler = setInterval(tick, TICK_MS);
-  void tick();
+  g.__maxDispatchScheduler = setInterval(() => void runSchedulerTick(), TICK_MS);
+  void runSchedulerTick();
   console.log("[scheduler] планировщик напоминаний запущен");
 }
