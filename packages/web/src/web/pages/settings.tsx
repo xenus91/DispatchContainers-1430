@@ -324,6 +324,7 @@ export default function SettingsPage() {
               )
             }
           />
+          <Field label="Планировщик (напоминания, опоздания)" value={<SchedulerBadge at={integration.data?.scheduler?.at ?? null} />} />
         </div>
 
         <div className="mt-4 space-y-2 border-t border-border pt-4">
@@ -401,4 +402,13 @@ export default function SettingsPage() {
       </Card>
     </div>
   );
+}
+
+/** Последний проход планировщика: зелёный — работает, красный — сервер «спит». */
+function SchedulerBadge({ at }: { at: string | null }) {
+  if (!at) return <Badge tone="warning">ещё не запускался</Badge>;
+  const min = Math.max(0, Math.round((Date.now() - new Date(at).getTime()) / 60_000));
+  const time = new Date(at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  if (min <= 2) return <Badge tone="success">работает · {time}</Badge>;
+  return <Badge tone="danger">пауза {min} мин · последний проход {time}</Badge>;
 }

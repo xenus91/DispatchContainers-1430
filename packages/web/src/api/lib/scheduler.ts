@@ -8,7 +8,7 @@ import { notifyDispatchers, notifyStaff } from "./notify";
 import { addHistory, raiseAlert } from "./requests-service";
 import { getStops, loadContext } from "./route";
 import { ALERT_LABELS, stopDone } from "./route-def";
-import { getReminderMinutes, getSetting, getStopLateMinutes } from "./settings";
+import { getReminderMinutes, getSetting, getStopLateMinutes, setSetting } from "./settings";
 
 const TICK_MS = 60_000;
 const DAY_MS = 86_400_000;
@@ -111,18 +111,64 @@ async function runAlertEscalation() {
 }
 
 let running: Promise<void> | null = null;
+let lastStartedAt = 0;
+
+export type TickSource = "interval" | "self" | "cron" | "boot";
 
 /**
  * Один проход планировщика. Вызывается таймером процесса, внешним cron (/api/cron/tick)
  *. Параллельные вызовы склеиваются,
  * а все отметки (напоминание, тревога, эскалация) захватываются в БД — повторов нет.
  */
-export function runSchedulerTick(): Promise<void> {
+export function runSchedulerTick(source: TickSource = "interval"): Promise<void> {
   if (running) return running;
-  running = tick().finally(() => {
-    running = null;
-  });
+  // Самопинг и внешний cron могут прийти почти одновременно с таймером — один проход в 20 с.
+  if (source !== "boot" && Date.now() - lastStartedAt < 20_000) return Promise.resolve();
+  lastStartedAt = Date.now();
+  running = tick()
+    .then(() => setSetting("scheduler:heartbeat", JSON.stringify({ at: new Date().toISOString(), source })))
+    .catch((e) => console.error("[scheduler] heartbeat:", e instanceof Error ? e.message : e))
+    .finally(() => {
+      running = null;
+    });
   return running;
+}
+
+/** Последний проход планировщика — для индикатора в настройках. */
+export async function schedulerHeartbeat(): Promise<{ at: string | null; source: string | null }> {
+  try {
+    const v = JSON.parse((await getSetting("scheduler:heartbeat")) || "{}") as { at?: string; source?: string };
+    return { at: v.at ?? null, source: v.source ?? null };
+  } catch {
+    return { at: null, source: null };
+  }
+}
+
+/**
+ * Публичный адрес, через который процесс будит сам себя. Хостинг усыпляет приложение
+ * без входящих запросов; запрос через внешний адрес считается входящим трафиком,
+ * поэтому раз в минуту процесс стучится в свой /api/cron/tick — и не засыпает,
+ * а проход планировщика идёт независимо от того, открыт ли кто-то приложение.
+ */
+function selfPingUrl(): string | null {
+  const base = (process.env.SCHEDULER_SELF_URL || process.env.WEBSITE_URL || "").replace(/\/+$/, "");
+  const key = process.env.CRON_SECRET || process.env.MAX_WEBHOOK_SECRET || "";
+  if (!/^https:\/\//.test(base) || !key || process.env.SCHEDULER_SELF_PING === "0") return null;
+  return `${base}/api/cron/tick?key=${encodeURIComponent(key)}&src=self`;
+}
+
+async function beat() {
+  const url = selfPingUrl();
+  if (url) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(45_000) });
+      if (res.ok) return; // проход уже выполнен обработчиком запроса
+      console.warn(`[scheduler] самопинг: HTTP ${res.status}, проход локально`);
+    } catch (e) {
+      console.warn("[scheduler] самопинг не удался, проход локально:", e instanceof Error ? e.message : e);
+    }
+  }
+  await runSchedulerTick("interval");
 }
 
 async function tick() {
@@ -140,7 +186,10 @@ async function tick() {
 export function startScheduler() {
   const g = globalThis as unknown as { __maxDispatchScheduler?: ReturnType<typeof setInterval> };
   if (g.__maxDispatchScheduler) return;
-  g.__maxDispatchScheduler = setInterval(() => void runSchedulerTick(), TICK_MS);
-  void runSchedulerTick();
-  console.log("[scheduler] планировщик напоминаний запущен");
+  g.__maxDispatchScheduler = setInterval(() => void beat(), TICK_MS);
+  void runSchedulerTick("boot");
+  const url = selfPingUrl();
+  console.log(
+    `[scheduler] планировщик запущен${url ? `, самопинг через ${new URL(url).origin}` : " (без самопинга: нет WEBSITE_URL/секрета)"}`,
+  );
 }

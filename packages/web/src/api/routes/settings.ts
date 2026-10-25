@@ -13,6 +13,8 @@ import {
 } from "../max/client";
 import { longPollingEnabled } from "../max/polling";
 
+import { schedulerHeartbeat } from "../lib/scheduler";
+
 export const settings = {
   /** Настройки читает любой авторизованный (нужны для отображения времени/названия). */
   get: authed.handler(async () => {
@@ -80,6 +82,7 @@ export const settings = {
       botUsername: maxConfig.botUsername,
       webhookSecretSet: !!maxConfig.webhookSecret,
       longPolling: longPollingEnabled(),
+      scheduler: await schedulerHeartbeat(),
     };
     if (isStubMode()) {
       return { ...base, bot: null, subscriptions: [] as { url: string; time: number | null }[], error: null };
