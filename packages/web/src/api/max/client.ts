@@ -1,5 +1,6 @@
 import { db } from "../database";
 import * as schema from "../database/schema";
+import { maxFetch } from "./tls";
 import type { MaxNewMessageBody, MaxSendResult, MaxUser } from "./types";
 
 /**
@@ -7,12 +8,14 @@ import type { MaxNewMessageBody, MaxSendResult, MaxUser } from "./types";
  * Домен и методы API меняются часто, поэтому вся остальная система работает
  * только через этот адаптер.
  *
- * Проверено вживую: база — https://botapi.max.ru, авторизация — заголовок
- * `Authorization: <token>` без префикса Bearer (query-параметр access_token
- * помечен в API как deprecated).
+ * База — https://platform-api2.max.ru (актуальный домен по dev.max.ru; botapi.max.ru
+ * и platform-api.max.ru — устаревшие). Сертификат домена выдан Минцифры, поэтому
+ * запросы идут через maxFetch с доверенными корнями (см. ./tls.ts).
+ * Авторизация — заголовок `Authorization: <token>` без префикса Bearer.
+ * Переопределение хоста: MAX_API_BASE_URL.
  */
 
-const BASE_URL = process.env.MAX_API_BASE_URL ?? "https://botapi.max.ru";
+const BASE_URL = (process.env.MAX_API_BASE_URL || "https://platform-api2.max.ru").replace(/\/+$/, "");
 const TOKEN = process.env.MAX_BOT_TOKEN ?? "";
 
 /** Режим заглушки: без токена (или при MAX_STUB=1) исходящие пишутся в bot_outbox. */
@@ -57,7 +60,7 @@ async function call<T>(
   for (const [k, v] of Object.entries(options.query ?? {})) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
-  const res = await fetch(url, {
+  const res = await maxFetch(url, {
     method,
     headers: {
       Authorization: TOKEN,
@@ -223,7 +226,7 @@ export async function answerCallback(
 /** Скачивание вложения по временной ссылке MAX (для переноса в постоянное хранилище). */
 export async function downloadAttachment(url: string): Promise<ArrayBuffer | null> {
   try {
-    const res = await fetch(url);
+    const res = await maxFetch(url);
     if (!res.ok) return null;
     return await res.arrayBuffer();
   } catch {

@@ -41,7 +41,9 @@ export async function runStopTimers() {
     for (const stop of stops) {
       const planned = stop.plannedArrivalAt?.getTime();
       if (!planned || stop.reminderSentAt || stop.arrivedAt || stopDone(stop).length) continue;
-      if (now < planned - reminderMinutes * 60_000 || now > planned + DAY_MS) continue;
+      // Только до планового времени: после него напоминание бессмысленно (например,
+      // после простоя сервера) — просрочку покрывает тревога stop_late.
+      if (now < planned - reminderMinutes * 60_000 || now > planned) continue;
       // Отметка до отправки: при сбое доставки повторов не будет.
       const [claimed] = await db
         .update(schema.requestStops)
@@ -127,7 +129,7 @@ export function runSchedulerTick(source: TickSource = "interval"): Promise<void>
   lastStartedAt = Date.now();
   running = tick()
     .then(() => setSetting("scheduler:heartbeat", JSON.stringify({ at: new Date().toISOString(), source })))
-    .catch((e) => console.error("[scheduler] heartbeat:", e instanceof Error ? e.message : e))
+    .catch((e) => console.error("[scheduler] heartbeat:", describeError(e)))
     .finally(() => {
       running = null;
     });
@@ -171,6 +173,23 @@ async function beat() {
   await runSchedulerTick("interval");
 }
 
+/** Сообщение ошибки вместе с цепочкой cause (drizzle прячет сетевую причину туда). */
+function describeError(e: unknown): string {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; cur && i < 5; i++) {
+    if (cur instanceof Error) {
+      const code = (cur as { code?: string }).code;
+      parts.push(`${cur.message.split("\n")[0].slice(0, 200)}${code ? ` [${code}]` : ""}`);
+      cur = (cur as { cause?: unknown }).cause;
+    } else {
+      parts.push(String(cur));
+      break;
+    }
+  }
+  return parts.join(" ← ");
+}
+
 async function tick() {
   try {
     await runStopTimers();
@@ -178,7 +197,7 @@ async function tick() {
     await runAccessChecks();
     await purgeProcessedUpdates();
   } catch (e) {
-    console.error("[scheduler] tick failed:", e instanceof Error ? e.message : e);
+    console.error("[scheduler] tick failed:", describeError(e));
   }
 }
 

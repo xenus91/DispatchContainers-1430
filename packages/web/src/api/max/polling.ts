@@ -1,4 +1,5 @@
 import { getSetting, setSetting } from "../lib/settings";
+import { maxFetch } from "./tls";
 import { isStubMode, maxConfig } from "./client";
 import type { MaxUpdate } from "./types";
 import { claimUpdate } from "./dedupe";
@@ -62,7 +63,7 @@ async function fetchUpdates(marker: number | null): Promise<UpdateList> {
   url.searchParams.set("timeout", String(TIMEOUT_SEC));
   if (marker !== null) url.searchParams.set("marker", String(marker));
 
-  const res = await fetch(url, {
+  const res = await maxFetch(url, {
     headers: { Authorization: process.env.MAX_BOT_TOKEN ?? "" },
     signal: AbortSignal.timeout((TIMEOUT_SEC + 15) * 1000),
   });

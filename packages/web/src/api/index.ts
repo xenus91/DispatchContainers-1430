@@ -46,7 +46,7 @@ export type AppRouterClient = RouterClient<AppRouter>;
 const app = createApp(router);
 mountCron(app);
 
-/** MAX Bot API webhook — subscribed via POST /subscriptions on botapi.max.ru. */
+/** MAX Bot API webhook — subscribed via POST /subscriptions (platform-api2.max.ru). */
 app.post("/api/webhooks/max", async (c) => {
   const secret = maxConfig.webhookSecret;
   if (secret) {
